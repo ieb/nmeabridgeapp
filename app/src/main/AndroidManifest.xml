@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- TCP server socket -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Bluetooth (legacy, API < 31) -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!-- Bluetooth (API 31+) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <!-- Location required for BT scan on older APIs -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <!-- Foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <!-- Keep CPU alive while streaming -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Notification for foreground service (API 33+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Optional hardware — app works without these (simulator mode) -->
+    <uses-feature android:name="android.hardware.bluetooth"
+        android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps"
+        android:required="false" />
+
+    <application
+        android:name=".NmeaBridgeApp"
+        android:label="NMEA Bridge"
+        android:icon="@android:drawable/ic_menu_mylocation"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:resizeableActivity="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.NmeaForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+    </application>
+</manifest>
