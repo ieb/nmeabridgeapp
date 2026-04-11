@@ -96,7 +96,7 @@ fun ServerScreen(
                 onClick = { viewModel.setSourceType(SourceType.BLE_GPS) },
                 shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
                 enabled = !serviceState.isRunning && bluetoothAvailable
-            ) { Text("BLE GPS") }
+            ) { Text("BLE Nav") }
             SegmentedButton(
                 selected = sourceType == SourceType.BLUETOOTH,
                 onClick = { viewModel.setSourceType(SourceType.BLUETOOTH) },
@@ -121,7 +121,7 @@ fun ServerScreen(
             )
         }
 
-        // BLE GPS device scan + selection
+        // BLE Nav device scan + selection
         if (sourceType == SourceType.BLE_GPS) {
             val bleAddress by viewModel.bleAddress.collectAsState()
             val bleScannedDevices by viewModel.bleScannedDevices.collectAsState()
@@ -289,7 +289,7 @@ private fun StatusCard(state: ServiceState) {
             StatusRow("Source", when (state.sourceType) {
                 SourceType.SIMULATOR -> "Simulator"
                 SourceType.BLUETOOTH -> "BT Classic: ${state.bluetoothDeviceName}"
-                SourceType.BLE_GPS -> "BLE GPS: ${state.bluetoothDeviceName}"
+                SourceType.BLE_GPS -> "BLE Nav: ${state.bluetoothDeviceName}"
             })
             if (state.sourceType == SourceType.BLUETOOTH || state.sourceType == SourceType.BLE_GPS) {
                 StatusRow("BT Status", when {
