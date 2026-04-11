@@ -1,0 +1,219 @@
+package uk.co.tfd.nmeabridge.ui
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.ParcelUuid
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import uk.co.tfd.nmeabridge.bluetooth.BleNmeaSource
+import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceInfo
+import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
+import uk.co.tfd.nmeabridge.service.NmeaForegroundService
+import uk.co.tfd.nmeabridge.service.ServiceState
+import uk.co.tfd.nmeabridge.service.SourceType
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+data class BleScannedDevice(
+    val name: String,
+    val address: String
+)
+
+class ServerViewModel : ViewModel() {
+
+    companion object {
+        private const val PREFS_NAME = "nmea_bridge_settings"
+        private const val KEY_SOURCE_TYPE = "source_type"
+        private const val KEY_PORT = "port"
+        private const val KEY_BLE_ADDRESS = "ble_address"
+        private const val KEY_BT_ADDRESS = "bt_address"
+    }
+
+    private val _serviceState = MutableStateFlow(ServiceState())
+    val serviceState: StateFlow<ServiceState> = _serviceState.asStateFlow()
+
+    private val _port = MutableStateFlow(10110)
+    val port: StateFlow<Int> = _port.asStateFlow()
+
+    private val _sourceType = MutableStateFlow(SourceType.SIMULATOR)
+    val sourceType: StateFlow<SourceType> = _sourceType.asStateFlow()
+
+    private val _selectedDevice = MutableStateFlow<BluetoothDeviceInfo?>(null)
+    val selectedDevice: StateFlow<BluetoothDeviceInfo?> = _selectedDevice.asStateFlow()
+
+    private val _pairedDevices = MutableStateFlow<List<BluetoothDeviceInfo>>(emptyList())
+    val pairedDevices: StateFlow<List<BluetoothDeviceInfo>> = _pairedDevices.asStateFlow()
+
+    private val _bleAddress = MutableStateFlow("")
+    val bleAddress: StateFlow<String> = _bleAddress.asStateFlow()
+
+    private val _bleScannedDevices = MutableStateFlow<List<BleScannedDevice>>(emptyList())
+    val bleScannedDevices: StateFlow<List<BleScannedDevice>> = _bleScannedDevices.asStateFlow()
+
+    private val _bleScanning = MutableStateFlow(false)
+    val bleScanning: StateFlow<Boolean> = _bleScanning.asStateFlow()
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val seenBleAddresses = mutableSetOf<String>()
+    private var savedBtAddress: String? = null
+
+    private val bleScanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val address = result.device.address ?: return
+            if (address in seenBleAddresses) return
+            seenBleAddresses.add(address)
+
+            val name = try { result.device.name } catch (_: Exception) { null } ?: "NMEA GPS"
+            handler.post {
+                _bleScannedDevices.value = _bleScannedDevices.value + BleScannedDevice(name, address)
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            handler.post { _bleScanning.value = false }
+        }
+    }
+
+    private var service: NmeaForegroundService? = null
+    private var bound = false
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            service = (binder as NmeaForegroundService.LocalBinder).service
+            bound = true
+            viewModelScope.launch {
+                service!!.state.collect { _serviceState.value = it }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            service = null
+            bound = false
+        }
+    }
+
+    fun loadSettings(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        _port.value = prefs.getInt(KEY_PORT, 10110)
+        _bleAddress.value = prefs.getString(KEY_BLE_ADDRESS, "") ?: ""
+        savedBtAddress = prefs.getString(KEY_BT_ADDRESS, null)
+        val sourceStr = prefs.getString(KEY_SOURCE_TYPE, null)
+        if (sourceStr != null) {
+            try {
+                _sourceType.value = SourceType.valueOf(sourceStr)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun saveSettings(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(KEY_SOURCE_TYPE, _sourceType.value.name)
+            .putInt(KEY_PORT, _port.value)
+            .putString(KEY_BLE_ADDRESS, _bleAddress.value)
+            .putString(KEY_BT_ADDRESS, _selectedDevice.value?.address ?: savedBtAddress)
+            .apply()
+    }
+
+    fun bindService(context: Context) {
+        val intent = Intent(context, NmeaForegroundService::class.java)
+        context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    fun unbindService(context: Context) {
+        if (bound) {
+            context.unbindService(connection)
+            bound = false
+            service = null
+        }
+    }
+
+    fun refreshPairedDevices(context: Context) {
+        _pairedDevices.value = BluetoothDeviceSelector.getPairedDevices(context)
+        // Restore previously selected BT Classic device
+        if (_selectedDevice.value == null && savedBtAddress != null) {
+            _selectedDevice.value = _pairedDevices.value.find { it.address == savedBtAddress }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun scanForBleNmeaDevices(context: Context) {
+        if (_bleScanning.value) return
+
+        val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val scanner = btManager?.adapter?.bluetoothLeScanner ?: return
+
+        seenBleAddresses.clear()
+        _bleScannedDevices.value = emptyList()
+        _bleScanning.value = true
+
+        val filter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid(BleNmeaSource.NMEA_SERVICE_UUID))
+            .build()
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        scanner.startScan(listOf(filter), settings, bleScanCallback)
+
+        handler.postDelayed({
+            try { scanner.stopScan(bleScanCallback) } catch (_: Exception) {}
+            _bleScanning.value = false
+        }, 8_000L)
+    }
+
+    fun selectBleDevice(device: BleScannedDevice) {
+        _bleAddress.value = device.address
+    }
+
+    fun setPort(port: Int) {
+        _port.value = port
+    }
+
+    fun setSourceType(type: SourceType) {
+        _sourceType.value = type
+    }
+
+    fun setSelectedDevice(device: BluetoothDeviceInfo?) {
+        _selectedDevice.value = device
+    }
+
+    fun setBleAddress(address: String) {
+        _bleAddress.value = address
+    }
+
+    fun startServer(context: Context) {
+        saveSettings(context)
+        val intent = Intent(context, NmeaForegroundService::class.java).apply {
+            putExtra(NmeaForegroundService.EXTRA_PORT, _port.value)
+            putExtra(NmeaForegroundService.EXTRA_SOURCE_TYPE, _sourceType.value.name)
+            when (_sourceType.value) {
+                SourceType.BLUETOOTH -> putExtra(NmeaForegroundService.EXTRA_BT_ADDRESS, _selectedDevice.value?.address)
+                SourceType.BLE_GPS -> putExtra(NmeaForegroundService.EXTRA_BT_ADDRESS, _bleAddress.value)
+                else -> {}
+            }
+        }
+        ContextCompat.startForegroundService(context, intent)
+        bindService(context)
+    }
+
+    fun stopServer(context: Context) {
+        unbindService(context)
+        context.stopService(Intent(context, NmeaForegroundService::class.java))
+        _serviceState.value = ServiceState()
+    }
+}

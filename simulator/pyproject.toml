@@ -1,0 +1,12 @@
+[project]
+name = "nmea-ble-simulator"
+version = "0.1.0"
+description = "BLE GATT peripheral that streams NMEA0183 sentences, for testing NMEA Bridge on Chromebook"
+requires-python = ">=3.11"
+dependencies = [
+    "pyobjc-framework-CoreBluetooth>=10.0",
+    "pyobjc-framework-libdispatch>=10.0",
+]
+
+[project.scripts]
+nmea-ble-sim = "nmea_ble_sim:main"

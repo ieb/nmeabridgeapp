@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.nmeabridge"
+    namespace = "uk.co.tfd.nmeabridge"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.nmeabridge"
+        applicationId = "uk.co.tfd.nmeabridge"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

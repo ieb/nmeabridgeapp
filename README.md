@@ -45,11 +45,53 @@ The APK will be at `app/build/outputs/apk/debug/app-debug.apk`.
 
 ### Install on device
 
+Android 11 will ADB Wifi Pair, but once that is done the device does not appear in the list of available devices. Connect is required also.
+
+Developer Options -> ADB over Wifi -> Pair displays a dedicated port and pin for pairing and
+
+```bash
+adb pair <ip>:<port>
+```
+Once paired using the port shown on the ADB over Wifi Screen, which is static
+
+```bash
+adb connect <ip>:<main port>
+```
+
+Confirm the device is listed
+
+```bash
+adb devices -l
+```
+
+Install, using -s to specify the device if you have more than 1 listed
+
 ```bash
 ./gradlew installDebug
 # or
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
+
+### Retrieving logs
+
+With an ADB connection established, fetch logs for the app:
+
+```bash
+# Dump recent logs for the app process
+adb logcat -d --pid=$(adb shell pidof uk.co.tfd.nmeabridge)
+
+# Save to a file (last 500 lines)
+adb logcat -d --pid=$(adb shell pidof uk.co.tfd.nmeabridge) | tail -500 > logcat.txt
+
+# Stream logs live (Ctrl+C to stop)
+adb logcat --pid=$(adb shell pidof uk.co.tfd.nmeabridge)
+
+# Filter to Bluetooth-related entries only
+adb logcat -d --pid=$(adb shell pidof uk.co.tfd.nmeabridge) | grep -i bluetooth
+```
+
+If using multiple ADB devices, add `-s <device>` after `adb`, e.g. `adb -s 192.168.1.117:40161 logcat ...`
+
 
 ## Usage
 
