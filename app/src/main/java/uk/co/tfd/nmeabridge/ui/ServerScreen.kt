@@ -135,7 +135,7 @@ fun ServerScreen(
                     onClick = onBleScan,
                     enabled = !serviceState.isRunning && !bleScanning
                 ) {
-                    Text(if (bleScanning) "Scanning..." else "Scan for NMEA GPS")
+                    Text(if (bleScanning) "Scanning..." else "Scan for BLE Nav")
                 }
                 if (bleAddress.isNotEmpty()) {
                     Text(

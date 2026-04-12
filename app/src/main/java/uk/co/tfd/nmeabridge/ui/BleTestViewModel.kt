@@ -43,7 +43,7 @@ class BleTestViewModel : ViewModel() {
 
     companion object {
         private const val SCAN_TIMEOUT_MS = 10_000L
-        val BOATWATCH_SERVICE_UUID: UUID = UUID.fromString("0000AA00-0000-1000-8000-00805f9b34fb")
+        val NAV_DATA_SERVICE_UUID: UUID = UUID.fromString("0000FF00-0000-1000-8000-00805f9b34fb")
     }
 
     private val _state = MutableStateFlow(BleTestState())
@@ -137,21 +137,21 @@ class BleTestViewModel : ViewModel() {
                 val services = g.services
                 appendLog("Discovered ${services.size} service(s):")
 
-                var foundBoatWatch = false
+                var foundNavData = false
                 for (service in services) {
                     val shortUuid = formatUuid(service.uuid.toString())
-                    val isBoatWatch = service.uuid == BOATWATCH_SERVICE_UUID
-                    if (isBoatWatch) foundBoatWatch = true
+                    val isNavData = service.uuid == NAV_DATA_SERVICE_UUID
+                    if (isNavData) foundNavData = true
 
-                    val marker = if (isBoatWatch) " << BOATWATCH" else ""
+                    val marker = if (isNavData) " << NAV DATA" else ""
                     appendLog("  Service: $shortUuid$marker")
                     logCharacteristics(service)
                 }
 
-                if (foundBoatWatch) {
-                    appendLog("SUCCESS: BoatWatch service found!")
+                if (foundNavData) {
+                    appendLog("SUCCESS: Nav Data service found!")
                 } else {
-                    appendLog("BoatWatch service (AA00) not found on this device")
+                    appendLog("Nav Data service (FF00) not found on this device")
                 }
 
                 appendLog("--- Test complete ---")
@@ -238,7 +238,7 @@ class BleTestViewModel : ViewModel() {
 
         seenAddresses.clear()
         _state.value = _state.value.copy(scanning = true, foundDevices = emptyList(), phase = "scanning")
-        appendLog("Starting BLE scan (${SCAN_TIMEOUT_MS / 1000}s)...")
+        appendLog("Starting BLE scan for Nav Data service (${SCAN_TIMEOUT_MS / 1000}s)...")
         appendLog("Android API: ${Build.VERSION.SDK_INT}, BT adapter: ${adapter.name ?: "unknown"}")
 
         val settings = ScanSettings.Builder()

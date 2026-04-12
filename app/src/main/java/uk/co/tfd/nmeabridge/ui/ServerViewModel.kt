@@ -3,9 +3,9 @@ package uk.co.tfd.nmeabridge.ui
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.os.ParcelUuid
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -13,7 +13,6 @@ import android.content.ServiceConnection
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -41,6 +40,7 @@ class ServerViewModel : ViewModel() {
         private const val KEY_PORT = "port"
         private const val KEY_BLE_ADDRESS = "ble_address"
         private const val KEY_BT_ADDRESS = "bt_address"
+        private val NAV_SERVICE_PARCEL = ParcelUuid(BleNmeaSource.NMEA_SERVICE_UUID)
     }
 
     private val _serviceState = MutableStateFlow(ServiceState())
@@ -76,9 +76,15 @@ class ServerViewModel : ViewModel() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val address = result.device.address ?: return
             if (address in seenBleAddresses) return
-            seenBleAddresses.add(address)
 
-            val name = try { result.device.name } catch (_: Exception) { null } ?: "NMEA GPS"
+            val deviceName = try { result.device.name } catch (_: Exception) { null }
+            val advertisesNavService = result.scanRecord?.serviceUuids?.contains(NAV_SERVICE_PARCEL) == true
+
+            // Only show devices that advertise the Nav Data service or have a name
+            if (!advertisesNavService && deviceName == null) return
+
+            seenBleAddresses.add(address)
+            val name = deviceName ?: "BLE Nav"
             handler.post {
                 _bleScannedDevices.value = _bleScannedDevices.value + BleScannedDevice(name, address)
             }
@@ -161,14 +167,11 @@ class ServerViewModel : ViewModel() {
         _bleScannedDevices.value = emptyList()
         _bleScanning.value = true
 
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(BleNmeaSource.NMEA_SERVICE_UUID))
-            .build()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        scanner.startScan(listOf(filter), settings, bleScanCallback)
+        scanner.startScan(null, settings, bleScanCallback)
 
         handler.postDelayed({
             try { scanner.stopScan(bleScanCallback) } catch (_: Exception) {}
