@@ -40,6 +40,7 @@ class ServerViewModel : ViewModel() {
         private const val KEY_PORT = "port"
         private const val KEY_BLE_ADDRESS = "ble_address"
         private const val KEY_BT_ADDRESS = "bt_address"
+        private const val KEY_BLE_PIN = "ble_pin"
         private val NAV_SERVICE_PARCEL = ParcelUuid(BleNmeaSource.NMEA_SERVICE_UUID)
     }
 
@@ -60,6 +61,9 @@ class ServerViewModel : ViewModel() {
 
     private val _bleAddress = MutableStateFlow("")
     val bleAddress: StateFlow<String> = _bleAddress.asStateFlow()
+
+    private val _blePin = MutableStateFlow("0000")
+    val blePin: StateFlow<String> = _blePin.asStateFlow()
 
     private val _bleScannedDevices = MutableStateFlow<List<BleScannedDevice>>(emptyList())
     val bleScannedDevices: StateFlow<List<BleScannedDevice>> = _bleScannedDevices.asStateFlow()
@@ -117,6 +121,7 @@ class ServerViewModel : ViewModel() {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _port.value = prefs.getInt(KEY_PORT, 10110)
         _bleAddress.value = prefs.getString(KEY_BLE_ADDRESS, "") ?: ""
+        _blePin.value = prefs.getString(KEY_BLE_PIN, "0000") ?: "0000"
         savedBtAddress = prefs.getString(KEY_BT_ADDRESS, null)
         val sourceStr = prefs.getString(KEY_SOURCE_TYPE, null)
         if (sourceStr != null) {
@@ -131,6 +136,7 @@ class ServerViewModel : ViewModel() {
             .putString(KEY_SOURCE_TYPE, _sourceType.value.name)
             .putInt(KEY_PORT, _port.value)
             .putString(KEY_BLE_ADDRESS, _bleAddress.value)
+            .putString(KEY_BLE_PIN, _blePin.value)
             .putString(KEY_BT_ADDRESS, _selectedDevice.value?.address ?: savedBtAddress)
             .apply()
     }
@@ -199,6 +205,10 @@ class ServerViewModel : ViewModel() {
         _bleAddress.value = address
     }
 
+    fun setBlePin(pin: String) {
+        _blePin.value = pin
+    }
+
     fun startServer(context: Context) {
         saveSettings(context)
         val intent = Intent(context, NmeaForegroundService::class.java).apply {
@@ -206,7 +216,10 @@ class ServerViewModel : ViewModel() {
             putExtra(NmeaForegroundService.EXTRA_SOURCE_TYPE, _sourceType.value.name)
             when (_sourceType.value) {
                 SourceType.BLUETOOTH -> putExtra(NmeaForegroundService.EXTRA_BT_ADDRESS, _selectedDevice.value?.address)
-                SourceType.BLE_GPS -> putExtra(NmeaForegroundService.EXTRA_BT_ADDRESS, _bleAddress.value)
+                SourceType.BLE_GPS -> {
+                    putExtra(NmeaForegroundService.EXTRA_BT_ADDRESS, _bleAddress.value)
+                    putExtra(NmeaForegroundService.EXTRA_BLE_PIN, _blePin.value)
+                }
                 else -> {}
             }
         }

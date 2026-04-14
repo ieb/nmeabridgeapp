@@ -126,6 +126,7 @@ fun ServerScreen(
             val bleAddress by viewModel.bleAddress.collectAsState()
             val bleScannedDevices by viewModel.bleScannedDevices.collectAsState()
             val bleScanning by viewModel.bleScanning.collectAsState()
+            val blePin by viewModel.blePin.collectAsState()
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -175,6 +176,18 @@ fun ServerScreen(
                     }
                 }
             }
+
+            OutlinedTextField(
+                value = blePin,
+                onValueChange = { text ->
+                    if (text.length <= 4) viewModel.setBlePin(text)
+                },
+                label = { Text("BLE PIN") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                modifier = Modifier.width(120.dp),
+                enabled = !serviceState.isRunning,
+                singleLine = true
+            )
         }
 
         // Port input

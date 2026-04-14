@@ -65,6 +65,7 @@ class NmeaForegroundService : Service() {
         val sourceTypeName = intent?.getStringExtra(EXTRA_SOURCE_TYPE) ?: SourceType.SIMULATOR.name
         val sourceType = SourceType.valueOf(sourceTypeName)
         val btAddress = intent?.getStringExtra(EXTRA_BT_ADDRESS)
+        val blePin = intent?.getStringExtra(EXTRA_BLE_PIN) ?: "0000"
 
         startForeground(NmeaBridgeApp.NOTIFICATION_ID, buildNotification())
         acquireWakeLock()
@@ -98,11 +99,16 @@ class NmeaForegroundService : Service() {
             }
             SourceType.BLE_GPS -> {
                 if (btAddress != null) {
-                    BleNmeaSource(this, btAddress) { connected, status ->
+                    BleNmeaSource(this, btAddress, blePin) { connected, status ->
                         _state.update {
                             it.copy(
                                 bluetoothConnected = connected,
-                                bluetoothStatus = status
+                                bluetoothStatus = status,
+                                errorMessage = when {
+                                    connected -> null
+                                    status != null && "failed" in status -> status
+                                    else -> it.errorMessage
+                                }
                             )
                         }
                     }
@@ -241,5 +247,6 @@ class NmeaForegroundService : Service() {
         const val EXTRA_PORT = "port"
         const val EXTRA_SOURCE_TYPE = "source_type"
         const val EXTRA_BT_ADDRESS = "bt_address"
+        const val EXTRA_BLE_PIN = "ble_pin"
     }
 }
