@@ -15,12 +15,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -29,9 +31,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import uk.co.tfd.nmeabridge.nmea.DerivedNav
 import uk.co.tfd.nmeabridge.nmea.NavigationState
+import uk.co.tfd.nmeabridge.nmea.Performance
 import uk.co.tfd.nmeabridge.service.ServiceState
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
 fun NavigationScreen(
@@ -41,6 +46,7 @@ fun NavigationScreen(
 ) {
     val state by viewModel.serviceState.collectAsState()
     val nav = state.navigationState
+    val perf = remember(nav) { nav?.let(Performance::derive) }
 
     Column(
         modifier = Modifier
@@ -121,6 +127,77 @@ fun NavigationScreen(
             NavCard(
                 label = "AWS",
                 value = formatSpeedKn(nav?.aws),
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // --- Derived performance (calculated on-phone) ---
+        PerformanceDivider()
+
+        // TWA / TWS
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            NavCard(
+                label = "TWA",
+                value = formatAnglePM180(perf?.twaDeg),
+                modifier = Modifier.weight(1f)
+            )
+            NavCard(
+                label = "TWS",
+                value = formatSpeedKn(perf?.twsKn),
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // POLAR / POLAR %
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            NavCard(
+                label = "POLAR",
+                value = formatSpeedKn(perf?.polarSpeedKn),
+                modifier = Modifier.weight(1f)
+            )
+            NavCard(
+                label = "POLAR %",
+                value = formatPercent(perf?.polarSpeedRatio),
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // VMG / VMG %
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            NavCard(
+                label = "VMG",
+                value = formatSignedSpeedKn(perf?.vmgKn),
+                modifier = Modifier.weight(1f)
+            )
+            NavCard(
+                label = "VMG %",
+                value = formatPercent(perf?.polarVmgRatio),
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // T-TWA / T-STW
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            NavCard(
+                label = "T-TWA",
+                value = formatAnglePM180(perf?.targetTwaDeg),
+                modifier = Modifier.weight(1f)
+            )
+            NavCard(
+                label = "T-STW",
+                value = formatSpeedKn(perf?.targetStwKn),
                 modifier = Modifier.weight(1f)
             )
         }
@@ -206,6 +283,23 @@ private fun NavCard(
     }
 }
 
+@Composable
+private fun PerformanceDivider() {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        HorizontalDivider(modifier = Modifier.weight(1f))
+        Text(
+            text = "PERFORMANCE (calculated)",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        HorizontalDivider(modifier = Modifier.weight(1f))
+    }
+}
+
 // --- Formatting functions ---
 
 private fun formatPosition(nav: NavigationState?): String {
@@ -227,13 +321,14 @@ private fun formatDDM(degrees: Double, pos: String, neg: String): String {
 
 private fun formatAngle360(deg: Double?): String {
     if (deg == null) return "---"
-    return "%05.1f\u00B0".format(deg)
+    val d = ((deg.roundToInt() % 360) + 360) % 360
+    return "%03d\u00B0".format(d)
 }
 
 private fun formatAnglePM180(deg: Double?): String {
     if (deg == null) return "---"
     val side = if (deg >= 0) "S" else "P"
-    return "$side%.1f\u00B0".format(abs(deg))
+    return "$side%d\u00B0".format(abs(deg).roundToInt())
 }
 
 private fun formatSpeedKn(kn: Double?): String {
@@ -254,5 +349,16 @@ private fun formatLog(nm: Double?): String {
 private fun formatVariation(deg: Double?): String {
     if (deg == null) return "VAR ---"
     val dir = if (deg >= 0) "E" else "W"
-    return "VAR %.1f\u00B0$dir".format(abs(deg))
+    return "VAR %d\u00B0$dir".format(abs(deg).roundToInt())
+}
+
+private fun formatSignedSpeedKn(kn: Double?): String {
+    if (kn == null) return "---"
+    val sign = if (kn >= 0) "+" else "\u2212"
+    return "$sign%.1f kn".format(abs(kn))
+}
+
+private fun formatPercent(ratio: Double?): String {
+    if (ratio == null) return "---"
+    return "%.0f %%".format(ratio * 100)
 }
