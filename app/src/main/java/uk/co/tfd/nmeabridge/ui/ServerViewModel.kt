@@ -25,7 +25,12 @@ import uk.co.tfd.nmeabridge.service.SourceType
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+data class BatterySample(val tMs: Long, val v: Float, val i: Float)
+
+private const val BATTERY_HISTORY_MAX_MS = 12L * 3600 * 1000
 
 data class BleScannedDevice(
     val name: String,
@@ -46,6 +51,9 @@ class ServerViewModel : ViewModel() {
 
     private val _serviceState = MutableStateFlow(ServiceState())
     val serviceState: StateFlow<ServiceState> = _serviceState.asStateFlow()
+
+    private val _batteryHistory = MutableStateFlow<List<BatterySample>>(emptyList())
+    val batteryHistory: StateFlow<List<BatterySample>> = _batteryHistory.asStateFlow()
 
     private val _port = MutableStateFlow(10110)
     val port: StateFlow<Int> = _port.asStateFlow()
@@ -101,6 +109,31 @@ class ServerViewModel : ViewModel() {
 
     private var service: NmeaForegroundService? = null
     private var bound = false
+
+    init {
+        viewModelScope.launch {
+            _serviceState.collect { st ->
+                val b = st.batteryState ?: return@collect
+                val now = System.currentTimeMillis()
+                val cutoff = now - BATTERY_HISTORY_MAX_MS
+                _batteryHistory.update { list ->
+                    val trimmed = if (list.isEmpty() || list.first().tMs >= cutoff) list
+                                  else list.dropWhile { it.tMs < cutoff }
+                    val last = trimmed.lastOrNull()
+                    // De-dup: avoid pushing an identical sample when the StateFlow re-emits
+                    // for unrelated reasons (e.g. ServiceState copy-update).
+                    if (last != null &&
+                        last.v == b.packV.toFloat() &&
+                        last.i == b.currentA.toFloat() &&
+                        now - last.tMs < 500) {
+                        trimmed
+                    } else {
+                        trimmed + BatterySample(now, b.packV.toFloat(), b.currentA.toFloat())
+                    }
+                }
+            }
+        }
+    }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -225,6 +258,10 @@ class ServerViewModel : ViewModel() {
         }
         ContextCompat.startForegroundService(context, intent)
         bindService(context)
+    }
+
+    fun setBatteryMonitoring(enabled: Boolean) {
+        service?.setBatteryMonitoring(enabled)
     }
 
     fun stopServer(context: Context) {

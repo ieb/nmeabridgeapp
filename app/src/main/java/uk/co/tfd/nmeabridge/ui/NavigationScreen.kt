@@ -36,7 +36,8 @@ import kotlin.math.abs
 @Composable
 fun NavigationScreen(
     viewModel: ServerViewModel,
-    onSettings: () -> Unit
+    onSettings: () -> Unit,
+    onBattery: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
     val nav = state.navigationState
@@ -161,8 +162,13 @@ fun NavigationScreen(
                     )
                 }
             }
-            TextButton(onClick = onSettings) {
-                Text("Settings")
+            Row {
+                TextButton(onClick = onBattery) {
+                    Text("Battery")
+                }
+                TextButton(onClick = onSettings) {
+                    Text("Settings")
+                }
             }
         }
     }

@@ -12,7 +12,9 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import uk.co.tfd.nmeabridge.nmea.BatteryState
 import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
+import uk.co.tfd.nmeabridge.nmea.BmsProtocol
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 import uk.co.tfd.nmeabridge.nmea.NmeaSource
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -37,6 +39,7 @@ class BleNmeaSource(
         val BW_SERVICE_UUID: UUID = UUID.fromString("0000AA00-0000-1000-8000-00805f9b34fb")
         val BW_AUTOPILOT_UUID: UUID = UUID.fromString("0000AA01-0000-1000-8000-00805f9b34fb")
         val BW_COMMAND_UUID: UUID = UUID.fromString("0000AA02-0000-1000-8000-00805f9b34fb")
+        val BW_BATTERY_UUID: UUID = UUID.fromString("0000AA03-0000-1000-8000-00805f9b34fb")
 
         private const val MAGIC_AUTOPILOT: Byte = 0xAA.toByte()
         private const val MAGIC_AUTH_RESP: Byte = 0xAF.toByte()
@@ -53,8 +56,15 @@ class BleNmeaSource(
     private val _navigationState = MutableStateFlow<NavigationState?>(null)
     val navigationState: StateFlow<NavigationState?> = _navigationState.asStateFlow()
 
+    private val _batteryState = MutableStateFlow<BatteryState?>(null)
+    val batteryState: StateFlow<BatteryState?> = _batteryState.asStateFlow()
+
     // Auth state
     private var commandChar: BluetoothGattCharacteristic? = null
+    private var batteryChar: BluetoothGattCharacteristic? = null
+    @Volatile private var batteryWanted: Boolean = false
+    @Volatile private var batterySubscribed: Boolean = false
+    @Volatile private var authenticated: Boolean = false
     private val pendingDescriptorWrites = ArrayDeque<() -> Unit>()
 
     // Buffer for accumulating bytes (in case a frame spans notifications)
@@ -74,6 +84,11 @@ class BleNmeaSource(
                     onConnectionStateChanged(false, "Disconnected")
                     g.close()
                     gatt = null
+                    authenticated = false
+                    batterySubscribed = false
+                    batteryChar = null
+                    commandChar = null
+                    pendingDescriptorWrites.clear()
                     if (running) {
                         onConnectionStateChanged(false, "Reconnecting in 3s...")
                         handler.postDelayed({ doConnect() }, RECONNECT_DELAY_MS)
@@ -110,6 +125,7 @@ class BleNmeaSource(
             if (bwService != null) {
                 val autopilotChar = bwService.getCharacteristic(BW_AUTOPILOT_UUID)
                 commandChar = bwService.getCharacteristic(BW_COMMAND_UUID)
+                batteryChar = bwService.getCharacteristic(BW_BATTERY_UUID)
 
                 if (autopilotChar != null && commandChar != null) {
                     // Step 2: subscribe to AA01 for auth response
@@ -179,23 +195,79 @@ class BleNmeaSource(
         if (charUuid == BW_AUTOPILOT_UUID && value.size >= 2 && value[0] == MAGIC_AUTH_RESP) {
             val accepted = value[1] == 0x01.toByte()
             if (accepted) {
+                authenticated = true
                 onConnectionStateChanged(true, null)
+                // If the user is already on the battery screen, subscribe now that we're authed
+                if (batteryWanted && !batterySubscribed) {
+                    handler.post { applyBatterySubscription(true) }
+                }
             } else {
                 onConnectionStateChanged(false, "Authentication failed: wrong PIN")
             }
+            return
+        }
+        if (charUuid == BW_BATTERY_UUID) {
+            val parsed = BmsProtocol.decode(value)
+            if (parsed != null) _batteryState.value = parsed
             return
         }
         processIncomingBytes(value)
     }
 
     @SuppressLint("MissingPermission")
-    private fun writeCccDescriptor(g: BluetoothGatt, desc: BluetoothGattDescriptor) {
+    private fun writeCccDescriptor(
+        g: BluetoothGatt,
+        desc: BluetoothGattDescriptor,
+        value: ByteArray = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+    ) {
         @Suppress("DEPRECATION")
         if (Build.VERSION.SDK_INT >= 33) {
-            g.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            g.writeDescriptor(desc, value)
         } else {
-            desc.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            desc.setValue(value)
             g.writeDescriptor(desc)
+        }
+    }
+
+    /**
+     * Toggle the battery characteristic (0xAA03) subscription. Safe to call from any thread
+     * and before connection is established — intent is remembered and applied once the GATT
+     * is connected and authenticated.
+     */
+    fun setBatterySubscribed(enabled: Boolean) {
+        batteryWanted = enabled
+        // Clear stale data when turning off so the UI doesn't show ghost values next time
+        if (!enabled) _batteryState.value = null
+        handler.post { applyBatterySubscription(enabled) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun applyBatterySubscription(enabled: Boolean) {
+        val g = gatt ?: return
+        val c = batteryChar ?: return
+        if (!authenticated) return
+        if (enabled == batterySubscribed) return
+
+        val idle = pendingDescriptorWrites.isEmpty()
+        val op: () -> Unit = {
+            g.setCharacteristicNotification(c, enabled)
+            val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
+            if (desc != null) {
+                val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                batterySubscribed = enabled
+                writeCccDescriptor(g, desc, v)
+            } else {
+                batterySubscribed = enabled
+                val next = pendingDescriptorWrites.removeFirstOrNull()
+                if (next != null) handler.post(next)
+            }
+        }
+        pendingDescriptorWrites.addLast(op)
+        // If nothing was in flight, kick the queue
+        if (idle) {
+            val next = pendingDescriptorWrites.removeFirstOrNull()
+            if (next != null) handler.post(next)
         }
     }
 

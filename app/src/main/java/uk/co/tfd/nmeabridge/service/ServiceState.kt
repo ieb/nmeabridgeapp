@@ -1,5 +1,6 @@
 package uk.co.tfd.nmeabridge.service
 
+import uk.co.tfd.nmeabridge.nmea.BatteryState
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 
 data class ServiceState(
@@ -15,6 +16,7 @@ data class ServiceState(
     val recentSentences: List<String> = emptyList(),
     val sentenceCount: Long = 0,
     val navigationState: NavigationState? = null,
+    val batteryState: BatteryState? = null,
     val errorMessage: String? = null
 )
 

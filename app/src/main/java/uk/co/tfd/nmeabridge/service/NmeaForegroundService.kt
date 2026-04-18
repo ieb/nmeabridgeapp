@@ -121,13 +121,18 @@ class NmeaForegroundService : Service() {
         }
         nmeaSource = source
 
-        // Collect navigation state from BLE source
+        // Collect navigation and battery state from BLE source
         if (source is BleNmeaSource) {
             serviceScope.launch {
                 source.navigationState.collect { nav ->
                     if (nav != null) {
                         _state.update { it.copy(navigationState = nav) }
                     }
+                }
+            }
+            serviceScope.launch {
+                source.batteryState.collect { battery ->
+                    _state.update { it.copy(batteryState = battery) }
                 }
             }
         }
@@ -187,6 +192,14 @@ class NmeaForegroundService : Service() {
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Toggle the battery (0xAA03) notification subscription at the firmware.
+     * No-op when the current source is not a BLE BoatWatch source.
+     */
+    fun setBatteryMonitoring(enabled: Boolean) {
+        (nmeaSource as? BleNmeaSource)?.setBatterySubscribed(enabled)
     }
 
     override fun onDestroy() {
