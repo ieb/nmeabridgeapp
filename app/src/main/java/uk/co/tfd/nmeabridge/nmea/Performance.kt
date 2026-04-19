@@ -20,8 +20,8 @@ data class DerivedNav(
     val polarSpeedRatio: Double?,  // null when polarSpeed ≈ 0
     val vmgKn: Double,             // stw * cos(twa); signed (+ toward wind)
     val polarVmgRatio: Double?,    // null when targetVmg ≈ 0
-    val targetTwaDeg: Double,      // signed, same tack as twa
-    val targetStwKn: Double
+    val targetTwaDeg: Double?,     // null when no target found (polar all 0 at this tws)
+    val targetStwKn: Double?
 )
 
 object Performance {
@@ -65,7 +65,7 @@ object Performance {
             twaLo = 90; twaHi = 180
         }
         var bestVmg = 0.0
-        var bestTwa = 0
+        var bestTwa = -1
         var bestStw = 0.0
         for (tt in twaLo..twaHi) {
             val tstw = Polar.polarSpeed(twsKn, tt.toDouble())
@@ -77,7 +77,10 @@ object Performance {
             }
         }
 
-        val targetTwaDeg = if (twaRad < 0) -bestTwa.toDouble() else bestTwa.toDouble()
+        val targetTwaDeg: Double? = if (bestTwa < 0) null
+                                    else if (twaRad < 0) -bestTwa.toDouble()
+                                    else bestTwa.toDouble()
+        val targetStwKn: Double? = if (bestTwa < 0) null else bestStw
         val polarVmgRatio = if (abs(bestVmg) > 1e-8) vmg / bestVmg else null
 
         return DerivedNav(
@@ -88,7 +91,7 @@ object Performance {
             vmgKn = vmg,
             polarVmgRatio = polarVmgRatio,
             targetTwaDeg = targetTwaDeg,
-            targetStwKn = bestStw
+            targetStwKn = targetStwKn
         )
     }
 }

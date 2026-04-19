@@ -17,17 +17,22 @@ class PerformanceTest {
 
     @Test
     fun polar_gridPointLookup() {
-        // Row 6 (twa=32°), col 5 (tws=10 kn) in the table = 67 → 6.7 kn
-        assertEquals(6.7, Polar.polarSpeed(10.0, 32.0), 1e-6)
+        // At (tws=10 kn, twa=32°): twaIdx=6, twsIdx=4 (tws[4]=10). Grid
+        // value map[6*17+4]=62 → 6.2 kn. At x == xl interpolate returns
+        // yl on both axes, so the answer is exact.
+        assertEquals(6.2, Polar.polarSpeed(10.0, 32.0), 1e-6)
     }
 
     @Test
-    fun polar_belowAndAboveAxesClamp() {
-        val lo = Polar.polarSpeed(-5.0, -10.0)
-        val hi = Polar.polarSpeed(1000.0, 1000.0)
-        // Axis end at tws=55 kn, twa=180° → last cell of map
-        assertEquals(3.9, hi, 1e-6)   // map[23*17+16] = 39 → 3.9 kn
-        assertEquals(0.0, lo, 1e-6)   // map[0] = 0
+    fun polar_belowAxisReturnsZero() {
+        assertEquals(0.0, Polar.polarSpeed(-5.0, -10.0), 1e-6)
+    }
+
+    @Test
+    fun polar_aboveAxisCornerValue() {
+        // Far corner: tws clamps to last index (60 kn), twa clamps to
+        // last (180°). Last cell of map = 39 → 3.9 kn.
+        assertEquals(3.9, Polar.polarSpeed(1000.0, 1000.0), 1e-6)
     }
 
     @Test
@@ -59,8 +64,9 @@ class PerformanceTest {
         )
         assertNotNull(d); d!!
         assertTrue("twa should be positive (starboard) got ${d.twaDeg}", d.twaDeg > 0)
-        assertTrue("targetTwa should match tack sign, got ${d.targetTwaDeg}", d.targetTwaDeg > 0)
-        assertTrue("targetTwa upwind should be in (0, 90) deg", d.targetTwaDeg in 0.0..90.0)
+        val tt = d.targetTwaDeg!!
+        assertTrue("targetTwa should match tack sign, got $tt", tt > 0)
+        assertTrue("targetTwa upwind should be in (0, 90) deg", tt in 0.0..90.0)
         assertTrue("tws should be positive", d.twsKn > 0)
     }
 
@@ -70,7 +76,7 @@ class PerformanceTest {
             NavigationState(awa = -45.0, aws = 15.0, stw = 5.0)
         )!!
         assertTrue(d.twaDeg < 0)
-        assertTrue(d.targetTwaDeg < 0)
+        assertTrue(d.targetTwaDeg!! < 0)
     }
 
     @Test
@@ -79,9 +85,10 @@ class PerformanceTest {
             NavigationState(awa = 160.0, aws = 20.0, stw = 5.0)
         )!!
         assertTrue("twa should be > 90° off the bow: ${d.twaDeg}", abs(d.twaDeg) > 90)
+        val tt = d.targetTwaDeg!!
         assertTrue(
-            "downwind target should be in (90, 180), got ${d.targetTwaDeg}",
-            abs(d.targetTwaDeg) in 90.0..180.0
+            "downwind target should be in (90, 180), got $tt",
+            abs(tt) in 90.0..180.0
         )
     }
 

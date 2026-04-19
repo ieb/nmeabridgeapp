@@ -2,19 +2,15 @@ package uk.co.tfd.nmeabridge.nmea
 
 /**
  * Pogo 1250 polar table, ported from
- * /Users/boston/ieb/N2KNMEA0183Wifi/lib/performance/pogo1250polar.h.
+ * `/Users/boston/ieb/N2KNMEA0183Wifi/lib/performance/pogo1250polar.h`.
  *
- * The firmware defines NTWS = 18 but each row in `polar_map` is 17 values
- * wide; the 18th tws entry (60 kn) is unreachable in practice. We drop it
- * and use a 17-col stride, which matches the real shape of the data.
- *
- * TWS axis is knots, TWA axis is degrees (both sorted). Speeds are stored
- * as tenths of a knot.
+ * Axes: TWS in knots (17 entries), TWA in degrees (24 entries). Speeds
+ * are stored as tenths of a knot, row-major as TWA × TWS.
  */
 object Polar {
 
     private val tws: IntArray = intArrayOf(
-        0, 0, 4, 6, 8, 10, 12, 14, 16, 20, 25, 30, 35, 40, 45, 50, 55
+        0, 4, 6, 8, 10, 12, 14, 16, 20, 25, 30, 35, 40, 45, 50, 55, 60
     )
     private val twa: IntArray = intArrayOf(
         0, 5, 10, 15, 20, 25, 32, 36, 40, 45, 52, 60, 70, 80, 90,
@@ -52,14 +48,14 @@ object Polar {
     )
 
     init {
-        require(map.size == ntws * ntwa) {
-            "polar map size ${map.size} != $ntws * $ntwa"
+        require(map.size == ntwa * ntws) {
+            "polar map size ${map.size} != $ntwa * $ntws"
         }
     }
 
     /**
      * Polar boat speed at the given true wind speed (kn) and absolute
-     * true wind angle (deg). Uses bilinear interpolation over the table,
+     * true wind angle (deg). Bilinear interpolation over the table,
      * clamped at the axis ends. Returns knots.
      */
     fun polarSpeed(twsKn: Double, absTwaDeg: Double): Double {
@@ -77,15 +73,18 @@ object Polar {
         val s10 = map[twaHi * ntws + twsLo] * 0.1
         val s11 = map[twaHi * ntws + twsHi] * 0.1
 
-        // Interpolate along TWA for each TWS column, then along TWS.
+        // Match the firmware order: interpolate the two TWS-sides across
+        // the TWA bracket first, then blend along TWS.
         val sLo = interpolate(absTwaDeg, xTwa0, xTwa1, s00, s10)
         val sHi = interpolate(absTwaDeg, xTwa0, xTwa1, s01, s11)
         return interpolate(twsKn, xTws0, xTws1, sLo, sHi)
     }
 
     /**
-     * Return (lo, hi) indices in [0, axis.size) bracketing v. If v is
-     * below or above the axis, both indices point at the end.
+     * Bracket `v` between two axis indices. Mirrors the firmware's
+     * `findIndexes`: below-axis returns (0,0); above-axis returns
+     * (last,last); in-range returns (i-1, i) where `axis[i]` is the
+     * first entry strictly greater than `v`.
      */
     private fun findBracket(v: Double, axis: IntArray): Pair<Int, Int> {
         if (v <= axis[0]) return 0 to 0
