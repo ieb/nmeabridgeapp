@@ -42,7 +42,8 @@ import kotlin.math.roundToInt
 fun NavigationScreen(
     viewModel: ServerViewModel,
     onSettings: () -> Unit,
-    onBattery: () -> Unit
+    onBattery: () -> Unit,
+    onEngine: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
     val nav = state.navigationState
@@ -240,6 +241,9 @@ fun NavigationScreen(
                 }
             }
             Row {
+                TextButton(onClick = onEngine) {
+                    Text("Engine")
+                }
                 TextButton(onClick = onBattery) {
                     Text("Battery")
                 }

@@ -135,6 +135,11 @@ class NmeaForegroundService : Service() {
                     _state.update { it.copy(batteryState = battery) }
                 }
             }
+            serviceScope.launch {
+                source.engineState.collect { engine ->
+                    _state.update { it.copy(engineState = engine) }
+                }
+            }
         }
 
         // Track sentences flowing through
@@ -200,6 +205,14 @@ class NmeaForegroundService : Service() {
      */
     fun setBatteryMonitoring(enabled: Boolean) {
         (nmeaSource as? BleNmeaSource)?.setBatterySubscribed(enabled)
+    }
+
+    /**
+     * Toggle the engine (0xFF02) notification subscription at the firmware.
+     * No-op when the current source is not a BLE source.
+     */
+    fun setEngineMonitoring(enabled: Boolean) {
+        (nmeaSource as? BleNmeaSource)?.setEngineSubscribed(enabled)
     }
 
     override fun onDestroy() {

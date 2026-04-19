@@ -264,6 +264,10 @@ class ServerViewModel : ViewModel() {
         service?.setBatteryMonitoring(enabled)
     }
 
+    fun setEngineMonitoring(enabled: Boolean) {
+        service?.setEngineMonitoring(enabled)
+    }
+
     fun stopServer(context: Context) {
         unbindService(context)
         context.stopService(Intent(context, NmeaForegroundService::class.java))

@@ -54,6 +54,9 @@ class GATTCharacteristic:
         self.value: bytearray = bytearray()
         self.cb_char: Optional[CBMutableCharacteristic] = None
         self.subscribers: set = set()  # set of CBCentral objects
+        # Latest frame held for retry if CoreBluetooth's transmit queue was full.
+        # Cleared when the peripheral manager signals it's ready to send again.
+        self.pending_data: Optional[bytearray] = None
 
 
 class GATTService:
@@ -181,7 +184,21 @@ class _PeripheralDelegate(NSObject):
         pm.respondToRequest_withResult_(requests[0], CBATTErrorSuccess)
 
     def peripheralManagerIsReadyToUpdateSubscribers_(self, pm):
-        logger.debug("Ready to update subscribers")
+        # CoreBluetooth signals that its transmit queue has drained. Flush any
+        # frames that we held back when updateValue... returned False.
+        for char in self._characteristics_by_cb.values():
+            data = char.pending_data
+            if data is None or not char.subscribers:
+                continue
+            ns_data = NSData.dataWithBytes_length_(bytes(data), len(data))
+            ok = pm.updateValue_forCharacteristic_onSubscribedCentrals_(
+                ns_data, char.cb_char, None
+            )
+            if ok:
+                char.pending_data = None
+            else:
+                # Still full — will be retried on the next ready callback.
+                break
 
 
 class BleGattServer:
@@ -264,7 +281,9 @@ class BleGattServer:
     def notify(self, char: GATTCharacteristic, data: bytearray) -> bool:
         """Send a notification to all subscribers of this characteristic.
 
-        Returns True if the notification was queued, False if the queue is full.
+        If the transmit queue is full, the frame is held and retried when
+        CoreBluetooth signals it's ready via peripheralManagerIsReadyToUpdateSubscribers_.
+        Returns True if the notification was queued to the radio, False if it was held.
         """
         if not char.subscribers:
             return False
@@ -273,9 +292,16 @@ class BleGattServer:
         ns_data = NSData.dataWithBytes_length_(bytes(data), len(data))
         pm = self._delegate._peripheral_manager
 
-        return pm.updateValue_forCharacteristic_onSubscribedCentrals_(
+        ok = pm.updateValue_forCharacteristic_onSubscribedCentrals_(
             ns_data, char.cb_char, None
         )
+        if ok:
+            char.pending_data = None
+        else:
+            # Hold this frame (overwriting any previously-held one — the caller
+            # always wants the freshest value to be delivered) for retry.
+            char.pending_data = bytearray(data)
+        return ok
 
     def has_subscribers(self, char: GATTCharacteristic) -> bool:
         return len(char.subscribers) > 0

@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Build
 import android.os.Handler
@@ -15,6 +16,8 @@ import android.os.Looper
 import uk.co.tfd.nmeabridge.nmea.BatteryState
 import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
 import uk.co.tfd.nmeabridge.nmea.BmsProtocol
+import uk.co.tfd.nmeabridge.nmea.EngineProtocol
+import uk.co.tfd.nmeabridge.nmea.EngineState
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 import uk.co.tfd.nmeabridge.nmea.NmeaSource
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -33,6 +36,7 @@ class BleNmeaSource(
     companion object {
         val NMEA_SERVICE_UUID: UUID = UUID.fromString("0000FF00-0000-1000-8000-00805f9b34fb")
         val NMEA_NOTIFY_UUID: UUID = UUID.fromString("0000FF01-0000-1000-8000-00805f9b34fb")
+        val ENGINE_STATE_UUID: UUID = UUID.fromString("0000FF02-0000-1000-8000-00805f9b34fb")
         val CCC_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         // BoatWatch auth service
@@ -59,13 +63,23 @@ class BleNmeaSource(
     private val _batteryState = MutableStateFlow<BatteryState?>(null)
     val batteryState: StateFlow<BatteryState?> = _batteryState.asStateFlow()
 
-    // Auth state
+    private val _engineState = MutableStateFlow<EngineState?>(null)
+    val engineState: StateFlow<EngineState?> = _engineState.asStateFlow()
+
     private var commandChar: BluetoothGattCharacteristic? = null
     private var batteryChar: BluetoothGattCharacteristic? = null
+    private var engineChar: BluetoothGattCharacteristic? = null
     @Volatile private var batteryWanted: Boolean = false
     @Volatile private var batterySubscribed: Boolean = false
+    @Volatile private var engineWanted: Boolean = false
+    @Volatile private var engineSubscribed: Boolean = false
     @Volatile private var authenticated: Boolean = false
-    private val pendingDescriptorWrites = ArrayDeque<() -> Unit>()
+
+    // Android GATT only allows one outstanding write at a time. We queue ops and only
+    // dispatch the next once the current one's completion callback fires. The flag
+    // guards against re-dispatching while a write is in flight.
+    @Volatile private var gattOpInFlight: Boolean = false
+    private val pendingGattOps = ArrayDeque<() -> Unit>()
 
     // Buffer for accumulating bytes (in case a frame spans notifications)
     private val frameBuffer = ByteArray(64)
@@ -87,8 +101,11 @@ class BleNmeaSource(
                     authenticated = false
                     batterySubscribed = false
                     batteryChar = null
+                    engineSubscribed = false
+                    engineChar = null
                     commandChar = null
-                    pendingDescriptorWrites.clear()
+                    pendingGattOps.clear()
+                    gattOpInFlight = false
                     if (running) {
                         onConnectionStateChanged(false, "Reconnecting in 3s...")
                         handler.postDelayed({ doConnect() }, RECONNECT_DELAY_MS)
@@ -117,8 +134,16 @@ class BleNmeaSource(
                 return
             }
 
-            // Queue up descriptor writes — GATT only allows one at a time
-            pendingDescriptorWrites.clear()
+            // Optional — only present on firmware that exposes engine telemetry
+            engineChar = service.getCharacteristic(ENGINE_STATE_UUID)
+
+            pendingGattOps.clear()
+            gattOpInFlight = false
+
+            // Queue: subscribe to FF01 nav notify
+            pendingGattOps.addLast {
+                enableNotifyOp(g, notifyChar)
+            }
 
             // Check for BoatWatch auth service
             val bwService = g.getService(BW_SERVICE_UUID)
@@ -128,20 +153,12 @@ class BleNmeaSource(
                 batteryChar = bwService.getCharacteristic(BW_BATTERY_UUID)
 
                 if (autopilotChar != null && commandChar != null) {
-                    // Step 2: subscribe to AA01 for auth response
-                    pendingDescriptorWrites.addLast {
-                        g.setCharacteristicNotification(autopilotChar, true)
-                        val apDesc = autopilotChar.getDescriptor(CCC_DESCRIPTOR_UUID)
-                        if (apDesc != null) {
-                            writeCccDescriptor(g, apDesc)
-                        } else {
-                            // No CCC descriptor — run next queued item directly
-                            val next = pendingDescriptorWrites.removeFirstOrNull()
-                            if (next != null) handler.post(next)
-                        }
+                    // Queue: subscribe to AA01 (auth response + autopilot state)
+                    pendingGattOps.addLast {
+                        enableNotifyOp(g, autopilotChar)
                     }
-                    // Step 3: send auth command
-                    pendingDescriptorWrites.addLast {
+                    // Queue: write auth command (characteristic write, waits for onCharacteristicWrite)
+                    pendingGattOps.addLast {
                         sendAuthCommand(g)
                     }
                     onConnectionStateChanged(false, "Authenticating...")
@@ -149,25 +166,21 @@ class BleNmeaSource(
                     onConnectionStateChanged(true, null)
                 }
             } else {
-                // No auth service (e.g. simulator) — just connect
+                // No auth service (e.g. old simulator) — just connect
                 onConnectionStateChanged(true, null)
             }
 
-            // Step 1: subscribe to FF01 for nav data (triggers the chain)
-            g.setCharacteristicNotification(notifyChar, true)
-            val desc = notifyChar.getDescriptor(CCC_DESCRIPTOR_UUID)
-            if (desc != null) {
-                writeCccDescriptor(g, desc)
-            }
+            kickQueue()
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             if (!running) return
-            // Process next queued operation
-            val next = pendingDescriptorWrites.removeFirstOrNull()
-            if (next != null) {
-                handler.post(next)
-            }
+            handler.post { onGattOpCompleted() }
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (!running) return
+            handler.post { onGattOpCompleted() }
         }
 
         // API 33+ callback
@@ -191,15 +204,52 @@ class BleNmeaSource(
         }
     }
 
+    /**
+     * Mark the current in-flight op as complete and dispatch the next queued op (if any).
+     * Always invoked on the main-looper thread.
+     */
+    private fun onGattOpCompleted() {
+        gattOpInFlight = false
+        kickQueue()
+    }
+
+    /**
+     * Dispatch the next queued op if no write is currently in flight. Safe to call repeatedly.
+     * Must be invoked on the main-looper thread.
+     */
+    private fun kickQueue() {
+        if (gattOpInFlight) return
+        val op = pendingGattOps.removeFirstOrNull() ?: return
+        gattOpInFlight = true
+        handler.post(op)
+    }
+
+    /**
+     * Shared helper for "enable notifications on this characteristic" ops. Writes the CCC
+     * descriptor; on failure or when there is no CCC, releases the in-flight flag so the
+     * queue keeps moving.
+     */
+    @SuppressLint("MissingPermission")
+    private fun enableNotifyOp(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+        g.setCharacteristicNotification(ch, true)
+        val desc = ch.getDescriptor(CCC_DESCRIPTOR_UUID)
+        if (desc == null || !writeCccDescriptor(g, desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+            onGattOpCompleted()
+        }
+    }
+
     private fun handleNotification(charUuid: UUID, value: ByteArray) {
         if (charUuid == BW_AUTOPILOT_UUID && value.size >= 2 && value[0] == MAGIC_AUTH_RESP) {
             val accepted = value[1] == 0x01.toByte()
             if (accepted) {
                 authenticated = true
                 onConnectionStateChanged(true, null)
-                // If the user is already on the battery screen, subscribe now that we're authed
+                // Kick off any subscriptions the user requested before auth completed
                 if (batteryWanted && !batterySubscribed) {
                     handler.post { applyBatterySubscription(true) }
+                }
+                if (engineWanted && !engineSubscribed) {
+                    handler.post { applyEngineSubscription(true) }
                 }
             } else {
                 onConnectionStateChanged(false, "Authentication failed: wrong PIN")
@@ -211,6 +261,11 @@ class BleNmeaSource(
             if (parsed != null) _batteryState.value = parsed
             return
         }
+        if (charUuid == ENGINE_STATE_UUID) {
+            val parsed = EngineProtocol.decode(value)
+            if (parsed != null) _engineState.value = parsed
+            return
+        }
         processIncomingBytes(value)
     }
 
@@ -219,12 +274,13 @@ class BleNmeaSource(
         g: BluetoothGatt,
         desc: BluetoothGattDescriptor,
         value: ByteArray = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-    ) {
-        @Suppress("DEPRECATION")
-        if (Build.VERSION.SDK_INT >= 33) {
-            g.writeDescriptor(desc, value)
+    ): Boolean {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            g.writeDescriptor(desc, value) == BluetoothStatusCodes.SUCCESS
         } else {
+            @Suppress("DEPRECATION")
             desc.setValue(value)
+            @Suppress("DEPRECATION")
             g.writeDescriptor(desc)
         }
     }
@@ -248,32 +304,56 @@ class BleNmeaSource(
         if (!authenticated) return
         if (enabled == batterySubscribed) return
 
-        val idle = pendingDescriptorWrites.isEmpty()
-        val op: () -> Unit = {
+        pendingGattOps.addLast {
             g.setCharacteristicNotification(c, enabled)
             val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
-            if (desc != null) {
-                val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-                batterySubscribed = enabled
-                writeCccDescriptor(g, desc, v)
-            } else {
-                batterySubscribed = enabled
-                val next = pendingDescriptorWrites.removeFirstOrNull()
-                if (next != null) handler.post(next)
+            val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+            batterySubscribed = enabled
+            if (desc == null || !writeCccDescriptor(g, desc, v)) {
+                onGattOpCompleted()
             }
         }
-        pendingDescriptorWrites.addLast(op)
-        // If nothing was in flight, kick the queue
-        if (idle) {
-            val next = pendingDescriptorWrites.removeFirstOrNull()
-            if (next != null) handler.post(next)
+        kickQueue()
+    }
+
+    /**
+     * Toggle the engine characteristic (0xFF02) subscription. Safe to call from any thread
+     * and before connection is established — intent is remembered and applied once the GATT
+     * is connected and authenticated.
+     */
+    fun setEngineSubscribed(enabled: Boolean) {
+        engineWanted = enabled
+        if (!enabled) _engineState.value = null
+        handler.post { applyEngineSubscription(enabled) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun applyEngineSubscription(enabled: Boolean) {
+        val g = gatt ?: return
+        val c = engineChar ?: return
+        if (!authenticated) return
+        if (enabled == engineSubscribed) return
+
+        pendingGattOps.addLast {
+            g.setCharacteristicNotification(c, enabled)
+            val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
+            val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+            engineSubscribed = enabled
+            if (desc == null || !writeCccDescriptor(g, desc, v)) {
+                onGattOpCompleted()
+            }
         }
+        kickQueue()
     }
 
     @SuppressLint("MissingPermission")
     private fun sendAuthCommand(g: BluetoothGatt) {
-        val cmd = commandChar ?: return
+        val cmd = commandChar ?: run {
+            onGattOpCompleted()
+            return
+        }
         val pinBytes = pin.toByteArray(Charsets.US_ASCII)
         val data = byteArrayOf(MAGIC_AUTOPILOT, CMD_AUTH,
             pinBytes.getOrElse(0) { '0'.code.toByte() },
@@ -281,14 +361,16 @@ class BleNmeaSource(
             pinBytes.getOrElse(2) { '0'.code.toByte() },
             pinBytes.getOrElse(3) { '0'.code.toByte() }
         )
-        @Suppress("DEPRECATION")
-        if (Build.VERSION.SDK_INT >= 33) {
-            g.writeCharacteristic(cmd, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+        val ok = if (Build.VERSION.SDK_INT >= 33) {
+            g.writeCharacteristic(cmd, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
         } else {
+            @Suppress("DEPRECATION")
             cmd.setValue(data)
             cmd.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            @Suppress("DEPRECATION")
             g.writeCharacteristic(cmd)
         }
+        if (!ok) onGattOpCompleted()
     }
 
     private fun processIncomingBytes(value: ByteArray) {
