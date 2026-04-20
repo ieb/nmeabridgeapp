@@ -29,7 +29,9 @@ class NmeaSentenceBuilderTest {
         )
         val body = sentence.substringAfter('$').substringBefore('*')
         val fields = body.split(",")
-        assertEquals("GGA should have 14 fields", 14, fields.size)
+        // talker+sentence, time, lat, N/S, lon, E/W, quality, sats, hdop,
+        // alt, M, geoidal sep (empty), M, age (empty), station id (empty) = 15
+        assertEquals("GGA should have 15 fields", 15, fields.size)
     }
 
     @Test
@@ -54,7 +56,9 @@ class NmeaSentenceBuilderTest {
         )
         val body = sentence.substringAfter('$').substringBefore('*')
         val fields = body.split(",")
-        assertEquals("RMC should have 12 fields", 12, fields.size)
+        // talker+sentence, time, status, lat, N/S, lon, E/W, speed, course,
+        // date, magvar, mag dir, mode indicator (NMEA 2.3+) = 13
+        assertEquals("RMC should have 13 fields", 13, fields.size)
     }
 
     @Test

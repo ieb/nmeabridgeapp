@@ -58,7 +58,7 @@ class EngineProtocolTest {
         assertEquals(22.0, e.engineRoomC!!, 1e-6)
         assertEquals(12.60, e.engineBattV!!, 1e-6)
         assertEquals(75.0, e.fuelPct!!, 1e-6)
-        assertTrue(e.alarms.isEmpty())
+        assertTrue(e.alarms!!.isEmpty())
     }
 
     @Test
@@ -110,7 +110,7 @@ class EngineProtocolTest {
 
     @Test
     fun decode_status1Bits() {
-        fun alarms(bit: Int) = EngineProtocol.decode(buildFrame(status1 = bit))!!.alarms
+        fun alarms(bit: Int) = EngineProtocol.decode(buildFrame(status1 = bit))!!.alarms!!
         assertTrue(alarms(0x0001).contains(EngineAlarm.CHECK_ENGINE))
         assertTrue(alarms(0x0002).contains(EngineAlarm.OVER_TEMPERATURE))
         assertTrue(alarms(0x0004).contains(EngineAlarm.LOW_OIL_PRESSURE))
@@ -122,7 +122,7 @@ class EngineProtocolTest {
 
     @Test
     fun decode_status2Bits() {
-        fun alarms(bit: Int) = EngineProtocol.decode(buildFrame(status2 = bit))!!.alarms
+        fun alarms(bit: Int) = EngineProtocol.decode(buildFrame(status2 = bit))!!.alarms!!
         assertTrue(alarms(0x0008).contains(EngineAlarm.MAINTENANCE_NEEDED))
         assertTrue(alarms(0x0010).contains(EngineAlarm.ENGINE_COMM_ERROR))
         assertTrue(alarms(0x0080).contains(EngineAlarm.ENGINE_SHUTTING_DOWN))
@@ -139,7 +139,18 @@ class EngineProtocolTest {
         val e = EngineProtocol.decode(
             buildFrame(status1 = reservedMask1, status2 = reservedMask2)
         )!!
-        assertTrue(e.alarms.isEmpty())
+        assertTrue(e.alarms!!.isEmpty())
+    }
+
+    @Test
+    fun decode_statusUnavailable() {
+        // Both status words at 0xFFFF means the firmware has no status info —
+        // must decode as null (not "all alarms active"), otherwise every
+        // defined alarm bit reads as set.
+        val e = EngineProtocol.decode(
+            buildFrame(status1 = 0xFFFF, status2 = 0xFFFF)
+        )!!
+        assertNull(e.alarms)
     }
 
     @Test

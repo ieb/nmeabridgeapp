@@ -30,7 +30,16 @@ import kotlinx.coroutines.launch
 
 data class BatterySample(val tMs: Long, val v: Float, val i: Float)
 
+data class EngineSample(
+    val tMs: Long,
+    val rpm: Int?,
+    val coolantC: Double?,
+    val exhaustC: Double?,
+    val alternatorC: Double?
+)
+
 private const val BATTERY_HISTORY_MAX_MS = 12L * 3600 * 1000
+private const val ENGINE_HISTORY_MAX_MS = 6L * 3600 * 1000
 
 data class BleScannedDevice(
     val name: String,
@@ -54,6 +63,9 @@ class ServerViewModel : ViewModel() {
 
     private val _batteryHistory = MutableStateFlow<List<BatterySample>>(emptyList())
     val batteryHistory: StateFlow<List<BatterySample>> = _batteryHistory.asStateFlow()
+
+    private val _engineHistory = MutableStateFlow<List<EngineSample>>(emptyList())
+    val engineHistory: StateFlow<List<EngineSample>> = _engineHistory.asStateFlow()
 
     private val _port = MutableStateFlow(10110)
     val port: StateFlow<Int> = _port.asStateFlow()
@@ -113,22 +125,53 @@ class ServerViewModel : ViewModel() {
     init {
         viewModelScope.launch {
             _serviceState.collect { st ->
-                val b = st.batteryState ?: return@collect
                 val now = System.currentTimeMillis()
-                val cutoff = now - BATTERY_HISTORY_MAX_MS
-                _batteryHistory.update { list ->
-                    val trimmed = if (list.isEmpty() || list.first().tMs >= cutoff) list
-                                  else list.dropWhile { it.tMs < cutoff }
-                    val last = trimmed.lastOrNull()
-                    // De-dup: avoid pushing an identical sample when the StateFlow re-emits
-                    // for unrelated reasons (e.g. ServiceState copy-update).
-                    if (last != null &&
-                        last.v == b.packV.toFloat() &&
-                        last.i == b.currentA.toFloat() &&
-                        now - last.tMs < 500) {
-                        trimmed
-                    } else {
-                        trimmed + BatterySample(now, b.packV.toFloat(), b.currentA.toFloat())
+
+                // Battery history
+                val b = st.batteryState
+                if (b != null) {
+                    val cutoff = now - BATTERY_HISTORY_MAX_MS
+                    _batteryHistory.update { list ->
+                        val trimmed = if (list.isEmpty() || list.first().tMs >= cutoff) list
+                                      else list.dropWhile { it.tMs < cutoff }
+                        val last = trimmed.lastOrNull()
+                        // De-dup: avoid pushing an identical sample when the StateFlow
+                        // re-emits for unrelated reasons (e.g. ServiceState copy-update).
+                        if (last != null &&
+                            last.v == b.packV.toFloat() &&
+                            last.i == b.currentA.toFloat() &&
+                            now - last.tMs < 500) {
+                            trimmed
+                        } else {
+                            trimmed + BatterySample(now, b.packV.toFloat(), b.currentA.toFloat())
+                        }
+                    }
+                }
+
+                // Engine history (RPM, coolant, exhaust, alternator-temp trace)
+                val e = st.engineState
+                if (e != null) {
+                    val cutoff = now - ENGINE_HISTORY_MAX_MS
+                    _engineHistory.update { list ->
+                        val trimmed = if (list.isEmpty() || list.first().tMs >= cutoff) list
+                                      else list.dropWhile { it.tMs < cutoff }
+                        val last = trimmed.lastOrNull()
+                        if (last != null &&
+                            last.rpm == e.rpm &&
+                            last.coolantC == e.coolantC &&
+                            last.exhaustC == e.exhaustC &&
+                            last.alternatorC == e.alternatorC &&
+                            now - last.tMs < 500) {
+                            trimmed
+                        } else {
+                            trimmed + EngineSample(
+                                tMs = now,
+                                rpm = e.rpm,
+                                coolantC = e.coolantC,
+                                exhaustC = e.exhaustC,
+                                alternatorC = e.alternatorC
+                            )
+                        }
                     }
                 }
             }

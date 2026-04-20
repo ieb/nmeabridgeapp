@@ -23,7 +23,7 @@ class MainActivity : ComponentActivity() {
     private val viewModel: ServerViewModel by viewModels()
     private val bleTestViewModel: BleTestViewModel by viewModels()
 
-    private enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE }
+    private enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS }
     private var currentScreen by mutableStateOf(Screen.NAV)
     private var pendingBleAction: (() -> Unit)? = null
 
@@ -81,7 +81,12 @@ class MainActivity : ComponentActivity() {
                         )
                         Screen.ENGINE -> EngineScreen(
                             viewModel = viewModel,
-                            onBack = { currentScreen = Screen.NAV }
+                            onBack = { currentScreen = Screen.NAV },
+                            onGraphs = { currentScreen = Screen.ENGINE_GRAPHS }
+                        )
+                        Screen.ENGINE_GRAPHS -> EngineGraphsScreen(
+                            viewModel = viewModel,
+                            onBack = { currentScreen = Screen.ENGINE }
                         )
                         Screen.SETTINGS -> ServerScreen(
                             viewModel = viewModel,

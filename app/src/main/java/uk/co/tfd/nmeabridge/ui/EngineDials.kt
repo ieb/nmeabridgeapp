@@ -66,6 +66,32 @@ private val DigitalGreen = Color(0xFFB3FF66)
 private val DigitalWindow = Color(0xFF0A0A0A)
 private val PillAlarm = Color(0xFFE53935)
 private val PillWarning = Color(0xFFFFA000)
+private val PillInfo = Color(0xFF455A64)
+
+/**
+ * Rendered as a clickable pill inside the tachometer. Used for real engine
+ * alarms (red/amber) and for synthetic status indicators (grey-blue) like
+ * "Connecting" or "Engine Off".
+ */
+data class StatusPill(
+    val shortCode: String,
+    val label: String,
+    val color: Color
+) {
+    companion object {
+        fun fromAlarm(alarm: EngineAlarm): StatusPill {
+            val color = when (alarm.severity) {
+                EngineAlarmSeverity.ALARM -> PillAlarm
+                EngineAlarmSeverity.WARNING -> PillWarning
+            }
+            return StatusPill(alarm.shortCode, alarm.label, color)
+        }
+
+        val Connecting = StatusPill("CONN", "Connecting", PillInfo)
+        val Idle = StatusPill("IDLE", "Idle", PillInfo)
+        val Off = StatusPill("OFF", "Engine off", PillInfo)
+    }
+}
 
 // --------- Public dial composables ---------
 
@@ -73,7 +99,7 @@ private val PillWarning = Color(0xFFFFA000)
 fun TachometerDial(
     rpm: Int?,
     engineHoursSec: Long?,
-    alarms: List<EngineAlarm> = emptyList(),
+    statusPills: List<StatusPill> = emptyList(),
     modifier: Modifier = Modifier
 ) {
     val maxRpm = 4000f
@@ -131,12 +157,12 @@ fun TachometerDial(
                 offsetYFrac = -0.30f
             )
         }
-        // Clickable alarm pills overlay: positioned just below the hour-meter
-        // window, inside the dial face. Tapping a pill shows the full alarm
+        // Clickable status pills overlay: positioned just below the hour-meter
+        // window, inside the dial face. Tapping a pill shows the full label
         // description in a tooltip.
-        if (alarms.isNotEmpty()) {
-            AlarmPillOverlay(
-                alarms = alarms,
+        if (statusPills.isNotEmpty()) {
+            StatusPillOverlay(
+                pills = statusPills,
                 modifier = Modifier
                     .align(Alignment.Center)
                     .offset(y = minDim * 0.32f)
@@ -148,8 +174,8 @@ fun TachometerDial(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun AlarmPillOverlay(
-    alarms: List<EngineAlarm>,
+private fun StatusPillOverlay(
+    pills: List<StatusPill>,
     modifier: Modifier = Modifier
 ) {
     FlowRow(
@@ -157,24 +183,20 @@ private fun AlarmPillOverlay(
         horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
         verticalArrangement = Arrangement.spacedBy(3.dp)
     ) {
-        alarms.forEach { alarm -> AlarmPill(alarm) }
+        pills.forEach { pill -> StatusPillView(pill) }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AlarmPill(alarm: EngineAlarm) {
+private fun StatusPillView(pill: StatusPill) {
     val tooltipState = rememberTooltipState(isPersistent = false)
     val scope = rememberCoroutineScope()
-    val pillColor = when (alarm.severity) {
-        EngineAlarmSeverity.ALARM -> PillAlarm
-        EngineAlarmSeverity.WARNING -> PillWarning
-    }
     TooltipBox(
         positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
         tooltip = {
             PlainTooltip {
-                Text(alarm.label)
+                Text(pill.label)
             }
         },
         state = tooltipState
@@ -182,12 +204,12 @@ private fun AlarmPill(alarm: EngineAlarm) {
         Box(
             modifier = Modifier
                 .clip(RoundedCornerShape(10.dp))
-                .background(pillColor)
+                .background(pill.color)
                 .clickable { scope.launch { tooltipState.show() } }
                 .padding(horizontal = 8.dp, vertical = 3.dp)
         ) {
             Text(
-                text = alarm.shortCode,
+                text = pill.shortCode,
                 color = Color.White,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,

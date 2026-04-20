@@ -49,5 +49,7 @@ data class EngineState(
     val engineRoomC: Double? = null,
     val engineBattV: Double? = null,
     val fuelPct: Double? = null,
-    val alarms: List<EngineAlarm> = emptyList()
+    // null when the firmware's status words are both unavailable (0xFFFF).
+    // An empty list means status was reported but no alarms are active.
+    val alarms: List<EngineAlarm>? = null
 )

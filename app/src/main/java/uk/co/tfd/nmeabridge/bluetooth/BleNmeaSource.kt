@@ -304,12 +304,17 @@ class BleNmeaSource(
         if (!authenticated) return
         if (enabled == batterySubscribed) return
 
+        // Update the flag EAGERLY (before the op dispatches). Otherwise, if two
+        // toggles are posted back-to-back on the main looper (e.g. screen A
+        // disposes with setEngineMonitoring(false) and screen B composes with
+        // (true) in the same frame), the second call would read the stale flag,
+        // see no change required, and return — leaving the subscription off.
+        batterySubscribed = enabled
         pendingGattOps.addLast {
             g.setCharacteristicNotification(c, enabled)
             val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
             val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-            batterySubscribed = enabled
             if (desc == null || !writeCccDescriptor(g, desc, v)) {
                 onGattOpCompleted()
             }
@@ -335,12 +340,13 @@ class BleNmeaSource(
         if (!authenticated) return
         if (enabled == engineSubscribed) return
 
+        // Eager flag update — see comment in applyBatterySubscription.
+        engineSubscribed = enabled
         pendingGattOps.addLast {
             g.setCharacteristicNotification(c, enabled)
             val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
             val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-            engineSubscribed = enabled
             if (desc == null || !writeCccDescriptor(g, desc, v)) {
                 onGattOpCompleted()
             }

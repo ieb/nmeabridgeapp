@@ -264,39 +264,3 @@ fun BatteryChart(
     // Touch the state so recomposition keeps following live when new data arrives
     LaunchedEffect(history.size) { /* no-op, triggers recompose */ }
 }
-
-/** Compute a padded axis range from samples; fall back when empty. */
-private fun niceRange(
-    values: List<Double>,
-    fallbackLo: Double,
-    fallbackHi: Double,
-    minSpan: Double,
-    includeZero: Boolean
-): Pair<Double, Double> {
-    if (values.isEmpty()) return fallbackLo to fallbackHi
-    var lo = values.min()
-    var hi = values.max()
-    if (includeZero) {
-        lo = min(lo, 0.0)
-        hi = max(hi, 0.0)
-    }
-    val span = (hi - lo).coerceAtLeast(minSpan)
-    // Expand span to minSpan if data is flat
-    if (hi - lo < minSpan) {
-        val mid = (hi + lo) / 2
-        lo = mid - span / 2
-        hi = mid + span / 2
-    }
-    // 10% padding above/below
-    val pad = (hi - lo) * 0.1
-    return (lo - pad) to (hi + pad)
-}
-
-private fun formatWindow(windowMs: Long): String {
-    val s = windowMs / 1000
-    return when {
-        s < 120 -> "${s}s"
-        s < 7200 -> "${s / 60}m"
-        else -> "${s / 3600}h"
-    }
-}

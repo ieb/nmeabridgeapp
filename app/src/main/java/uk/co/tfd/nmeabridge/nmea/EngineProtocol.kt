@@ -33,6 +33,17 @@ object EngineProtocol {
         val fuelRaw = buf.short.toInt() and 0xFFFF
         val status1 = buf.short.toInt() and 0xFFFF
         val status2 = buf.short.toInt() and 0xFFFF
+        // Per NMEA 2000 convention, 0xFFFF means "data not available". Treat
+        // each status word independently — a firmware that only populates one
+        // of the two words shouldn't have the unpopulated word decoded as
+        // "every bit set" (= every defined alarm active).
+        val alarms = when {
+            status1 == NA_U16 && status2 == NA_U16 -> null
+            else -> EngineAlarm.decode(
+                if (status1 == NA_U16) 0 else status1,
+                if (status2 == NA_U16) 0 else status2
+            )
+        }
 
         return EngineState(
             rpm = if (rpmRaw == NA_U16) null else (rpmRaw * 0.25).toInt(),
@@ -45,7 +56,7 @@ object EngineProtocol {
             engineRoomC = if (roomRaw == NA_U16) null else roomRaw * 0.01 - 273.15,
             engineBattV = if (engineBattRaw == NA_U16) null else engineBattRaw * 0.01,
             fuelPct = if (fuelRaw == NA_U16) null else fuelRaw * 0.004,
-            alarms = EngineAlarm.decode(status1, status2)
+            alarms = alarms
         )
     }
 }

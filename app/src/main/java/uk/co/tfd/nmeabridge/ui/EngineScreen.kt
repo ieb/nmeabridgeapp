@@ -11,9 +11,12 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -31,7 +34,8 @@ import uk.co.tfd.nmeabridge.nmea.EngineState
 @Composable
 fun EngineScreen(
     viewModel: ServerViewModel,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onGraphs: () -> Unit
 ) {
     DisposableEffect(Unit) {
         viewModel.setEngineMonitoring(true)
@@ -39,7 +43,11 @@ fun EngineScreen(
     }
 
     val state by viewModel.serviceState.collectAsState()
-    val engine = state.engineState
+    // Render dials and tiles even before the first engine packet arrives: an
+    // empty EngineState has all-null fields, which the dials display as "— —"
+    // with a dimmed needle. The tach-face pills (Connecting / Engine off /
+    // real alarms) communicate the current status.
+    val engine = state.engineState ?: EngineState()
 
     // BoxWithConstraints forces a bounded-height layout context so the
     // weights on the dials below actually resolve (weights silently collapse
@@ -60,25 +68,6 @@ fun EngineScreen(
         ) {
             EngineTopBar(onBack = onBack)
 
-            if (!state.bluetoothConnected || engine == null) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = when {
-                            !state.isRunning -> "Server stopped"
-                            !state.bluetoothConnected -> "Waiting for BLE connection…"
-                            else -> "Subscribing to engine…"
-                        },
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                return@Column
-            }
-
             // Active alarms are rendered INSIDE the tachometer dial (below the
             // hour meter) so they're always visible, regardless of how the
             // window is sized / clipped. Title + tiles take their intrinsic
@@ -86,30 +75,54 @@ fun EngineScreen(
             TachometerDial(
                 rpm = engine.rpm,
                 engineHoursSec = engine.engineHoursSec,
-                alarms = engine.alarms,
+                statusPills = enginePills(
+                    connected = state.bluetoothConnected,
+                    engineState = state.engineState
+                ),
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(2f)
             )
 
-            Row(
+            // Dials row: coolant + oil-pressure take full half-widths so the
+            // circles are as large as possible. The graphs button is overlaid at
+            // the bottom-centre — right in the wedge of empty space between the
+            // two circles near their base — so it reads as sitting "below the
+            // gap" between the dials, aligned with the bottom of the dial row
+            // and just above the ALT T tile in the row below.
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
-                horizontalArrangement = Arrangement.spacedBy(spacing)
+                    .weight(1f)
             ) {
-                CoolantDial(
-                    tempC = engine.coolantC,
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.spacedBy(spacing)
+                ) {
+                    CoolantDial(
+                        tempC = engine.coolantC,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                    )
+                    OilPressureDial(
+                        bar = engine.oilBar,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                    )
+                }
+                FilledIconButton(
+                    onClick = onGraphs,
                     modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                )
-                OilPressureDial(
-                    bar = engine.oilBar,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                )
+                        .size(40.dp)
+                        .align(Alignment.BottomCenter),
+                    colors = IconButtonDefaults.filledIconButtonColors()
+                ) {
+                    // Core Icons set lacks a chart glyph; use an emoji to avoid
+                    // pulling in material-icons-extended for a single image.
+                    Text(text = "📈", fontSize = 18.sp)
+                }
             }
 
             SecondaryValues(engine)
@@ -183,6 +196,28 @@ private fun EngineTile(
             )
         }
     }
+}
+
+private const val IDLE_RPM_THRESHOLD = 400
+
+/**
+ * Decide which pills to show on the tach face:
+ *   - "Connecting" — BLE not connected, or no engine frame has been received
+ *     yet.
+ *   - "Engine off" — the ECU isn't broadcasting engine data (rpm reported as
+ *     not-available). No alarm pills are emitted here: without rpm there's no
+ *     running engine to attach alarms to.
+ *   - "Idle" (rpm below IDLE_RPM_THRESHOLD) and "Running" (rpm at or above
+ *     threshold) both show any real alarms from status1/status2. Idle adds
+ *     its own pill; running does not. If the status words report
+ *     not-available (engine.alarms == null), no alarm pills are shown —
+ *     we can't synthesise a state the firmware didn't report.
+ */
+private fun enginePills(connected: Boolean, engineState: EngineState?): List<StatusPill> {
+    if (!connected || engineState == null) return listOf(StatusPill.Connecting)
+    val rpm = engineState.rpm ?: return listOf(StatusPill.Off)
+    val alarms = engineState.alarms?.map { StatusPill.fromAlarm(it) } ?: emptyList()
+    return if (rpm < IDLE_RPM_THRESHOLD) listOf(StatusPill.Idle) + alarms else alarms
 }
 
 private fun formatVolts(v: Double?): String =
