@@ -43,11 +43,16 @@ fun NavigationScreen(
     viewModel: ServerViewModel,
     onSettings: () -> Unit,
     onBattery: () -> Unit,
-    onEngine: () -> Unit
+    onEngine: () -> Unit,
+    onPolar: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
+    val polar by viewModel.activePolar.collectAsState()
     val nav = state.navigationState
-    val perf = remember(nav) { nav?.let(Performance::derive) }
+    val perf = remember(nav, polar) {
+        val p = polar
+        if (nav != null && p != null) Performance.derive(nav, p) else null
+    }
 
     Column(
         modifier = Modifier
@@ -241,6 +246,9 @@ fun NavigationScreen(
                 }
             }
             Row {
+                TextButton(onClick = onPolar) {
+                    Text("Polar")
+                }
                 TextButton(onClick = onEngine) {
                     Text("Engine")
                 }

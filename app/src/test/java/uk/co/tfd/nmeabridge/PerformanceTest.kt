@@ -8,60 +8,31 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 import uk.co.tfd.nmeabridge.nmea.Performance
-import uk.co.tfd.nmeabridge.nmea.Polar
+import uk.co.tfd.nmeabridge.nmea.PolarTable
 import kotlin.math.abs
 
 class PerformanceTest {
 
-    // --- Polar ---
-
-    @Test
-    fun polar_gridPointLookup() {
-        // At (tws=10 kn, twa=32°): twaIdx=6, twsIdx=4 (tws[4]=10). Grid
-        // value map[6*17+4]=62 → 6.2 kn. At x == xl interpolate returns
-        // yl on both axes, so the answer is exact.
-        assertEquals(6.2, Polar.polarSpeed(10.0, 32.0), 1e-6)
-    }
-
-    @Test
-    fun polar_belowAxisReturnsZero() {
-        assertEquals(0.0, Polar.polarSpeed(-5.0, -10.0), 1e-6)
-    }
-
-    @Test
-    fun polar_aboveAxisCornerValue() {
-        // Far corner: tws clamps to last index (60 kn), twa clamps to
-        // last (180°). Last cell of map = 39 → 3.9 kn.
-        assertEquals(3.9, Polar.polarSpeed(1000.0, 1000.0), 1e-6)
-    }
-
-    @Test
-    fun polar_offGridValueLiesBetweenNeighbours() {
-        // tws=11, twa=47° — between table rows twa=45° / twa=52° and cols tws=10 / tws=12.
-        val v = Polar.polarSpeed(11.0, 47.0)
-        val neighbours = listOf(
-            Polar.polarSpeed(10.0, 45.0),
-            Polar.polarSpeed(12.0, 45.0),
-            Polar.polarSpeed(10.0, 52.0),
-            Polar.polarSpeed(12.0, 52.0)
-        )
-        assertTrue("interp between $neighbours got $v", v >= neighbours.min() - 1e-6)
-        assertTrue("interp between $neighbours got $v", v <= neighbours.max() + 1e-6)
+    private val polar: PolarTable by lazy {
+        val csv = javaClass.classLoader!!
+            .getResourceAsStream("polars/pogo1250.csv")!!
+            .bufferedReader().use { it.readText() }
+        PolarTable.parseCsv("pogo1250", csv).getOrThrow()
     }
 
     // --- Performance.derive ---
 
     @Test
     fun derive_returnsNullWhenInputsMissing() {
-        assertNull(Performance.derive(NavigationState()))
-        assertNull(Performance.derive(NavigationState(awa = 45.0, aws = 10.0))) // no stw
+        assertNull(Performance.derive(NavigationState(), polar))
+        assertNull(Performance.derive(NavigationState(awa = 45.0, aws = 10.0), polar)) // no stw
     }
 
     @Test
     fun derive_starboardTackProducesPositiveTwaAndTargetTwa() {
         val d = Performance.derive(
             NavigationState(awa = 45.0, aws = 15.0, stw = 5.0)
-        )
+        , polar)
         assertNotNull(d); d!!
         assertTrue("twa should be positive (starboard) got ${d.twaDeg}", d.twaDeg > 0)
         val tt = d.targetTwaDeg!!
@@ -74,7 +45,7 @@ class PerformanceTest {
     fun derive_portTackProducesNegativeTwaAndTargetTwa() {
         val d = Performance.derive(
             NavigationState(awa = -45.0, aws = 15.0, stw = 5.0)
-        )!!
+        , polar)!!
         assertTrue(d.twaDeg < 0)
         assertTrue(d.targetTwaDeg!! < 0)
     }
@@ -83,7 +54,7 @@ class PerformanceTest {
     fun derive_downwindPicksTargetTwaAbove90() {
         val d = Performance.derive(
             NavigationState(awa = 160.0, aws = 20.0, stw = 5.0)
-        )!!
+        , polar)!!
         assertTrue("twa should be > 90° off the bow: ${d.twaDeg}", abs(d.twaDeg) > 90)
         val tt = d.targetTwaDeg!!
         assertTrue(
@@ -97,7 +68,7 @@ class PerformanceTest {
         // TWS=0 (awa=0, aws=stw) → true wind is zero, polar lookup → 0
         val d = Performance.derive(
             NavigationState(awa = 0.0, aws = 5.0, stw = 5.0)
-        )!!
+        , polar)!!
         assertEquals(0.0, d.twsKn, 1e-6)
         assertEquals(0.0, d.polarSpeedKn, 1e-6)
         assertNull(d.polarSpeedRatio)
@@ -108,12 +79,12 @@ class PerformanceTest {
         // Starboard close-hauled: boat makes good toward wind → +vmg
         val d = Performance.derive(
             NavigationState(awa = 45.0, aws = 15.0, stw = 5.0)
-        )!!
+        , polar)!!
         assertTrue("vmg to windward should be positive, got ${d.vmgKn}", d.vmgKn > 0)
         // Broad reach / run: vmg to windward is negative (making good downwind)
         val dn = Performance.derive(
             NavigationState(awa = 160.0, aws = 15.0, stw = 5.0)
-        )!!
+        , polar)!!
         assertTrue("vmg downwind should be negative, got ${dn.vmgKn}", dn.vmgKn < 0)
     }
 
@@ -121,7 +92,7 @@ class PerformanceTest {
     fun derive_polarVmgRatioIsNumeric() {
         val d = Performance.derive(
             NavigationState(awa = 45.0, aws = 15.0, stw = 5.0)
-        )!!
+        , polar)!!
         assertNotNull(d.polarVmgRatio)
         assertFalse(d.polarVmgRatio!!.isNaN())
     }

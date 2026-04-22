@@ -6,6 +6,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 import uk.co.tfd.nmeabridge.nmea.Performance
+import uk.co.tfd.nmeabridge.nmea.PolarTable
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import kotlin.math.PI
@@ -63,6 +64,13 @@ class PerformanceRegressionTest {
 
     @Test
     fun matchesFirmwareReferenceDataset() {
+        val polar = PolarTable.parseCsv(
+            "pogo1250",
+            javaClass.classLoader!!
+                .getResourceAsStream("polars/pogo1250.csv")!!
+                .bufferedReader().use { it.readText() }
+        ).getOrThrow()
+
         val stream = javaClass.classLoader!!
             .getResourceAsStream("performance_reference.csv")
         assertNotNull("performance_reference.csv not found on test classpath", stream)
@@ -80,7 +88,8 @@ class PerformanceRegressionTest {
             val awsKn = r.awsMs * MS_TO_KN
             val stwKn = r.stwMs * MS_TO_KN
             val derived = Performance.derive(
-                NavigationState(awa = awaDeg, aws = awsKn, stw = stwKn)
+                NavigationState(awa = awaDeg, aws = awsKn, stw = stwKn),
+                polar
             )
             if (derived == null) {
                 fieldMismatches++

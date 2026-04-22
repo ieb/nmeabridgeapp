@@ -33,7 +33,7 @@ object Performance {
      * Derive performance values from a nav frame. Returns null when any of
      * awa/aws/stw is missing — without those there is no true-wind vector.
      */
-    fun derive(nav: NavigationState): DerivedNav? {
+    fun derive(nav: NavigationState, polar: PolarTable): DerivedNav? {
         val awaDeg = nav.awa ?: return null
         val awsKn = nav.aws ?: return null
         val stwKn = nav.stw ?: return null
@@ -50,9 +50,9 @@ object Performance {
         val absTwaRad = abs(twaRad)
         val absTwaDeg = absTwaRad * DEG_PER_RAD
 
-        val polar = Polar.polarSpeed(twsKn, absTwaDeg)
+        val polarSpeedKn = polar.polarSpeed(twsKn, absTwaDeg)
 
-        val polarSpeedRatio = if (polar > 1e-8) stwKn / polar else null
+        val polarSpeedRatio = if (polarSpeedKn > 1e-8) stwKn / polarSpeedKn else null
         val vmg = stwKn * cos(twaRad)
 
         // Target TWA: iterate whole-degree TWAs on the current tack's
@@ -68,7 +68,7 @@ object Performance {
         var bestTwa = -1
         var bestStw = 0.0
         for (tt in twaLo..twaHi) {
-            val tstw = Polar.polarSpeed(twsKn, tt.toDouble())
+            val tstw = polar.polarSpeed(twsKn, tt.toDouble())
             val tvmg = tstw * cos(tt * RAD_PER_DEG)
             if (abs(tvmg) > abs(bestVmg)) {
                 bestVmg = tvmg
@@ -86,7 +86,7 @@ object Performance {
         return DerivedNav(
             twaDeg = twaRad * DEG_PER_RAD,
             twsKn = twsKn,
-            polarSpeedKn = polar,
+            polarSpeedKn = polarSpeedKn,
             polarSpeedRatio = polarSpeedRatio,
             vmgKn = vmg,
             polarVmgRatio = polarVmgRatio,

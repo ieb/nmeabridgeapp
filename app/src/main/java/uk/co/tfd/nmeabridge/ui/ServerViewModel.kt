@@ -16,9 +16,12 @@ import android.os.Looper
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import android.net.Uri
 import uk.co.tfd.nmeabridge.bluetooth.BleNmeaSource
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceInfo
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
+import uk.co.tfd.nmeabridge.nmea.PolarRepository
+import uk.co.tfd.nmeabridge.nmea.PolarTable
 import uk.co.tfd.nmeabridge.service.NmeaForegroundService
 import uk.co.tfd.nmeabridge.service.ServiceState
 import uk.co.tfd.nmeabridge.service.SourceType
@@ -96,6 +99,12 @@ class ServerViewModel : ViewModel() {
     // the actual firmware state.
     private val _wifiEnabled = MutableStateFlow(false)
     val wifiEnabled: StateFlow<Boolean> = _wifiEnabled.asStateFlow()
+
+    private var polarRepo: PolarRepository? = null
+    private val _activePolar = MutableStateFlow<PolarTable?>(null)
+    val activePolar: StateFlow<PolarTable?> = _activePolar.asStateFlow()
+    private val _polarNames = MutableStateFlow<List<String>>(emptyList())
+    val polarNames: StateFlow<List<String>> = _polarNames.asStateFlow()
 
     private val handler = Handler(Looper.getMainLooper())
     private val seenBleAddresses = mutableSetOf<String>()
@@ -200,6 +209,13 @@ class ServerViewModel : ViewModel() {
     }
 
     fun loadSettings(context: Context) {
+        if (polarRepo == null) {
+            val repo = PolarRepository(context.applicationContext)
+            polarRepo = repo
+            _polarNames.value = repo.list()
+            viewModelScope.launch { repo.active.collect { _activePolar.value = it } }
+            viewModelScope.launch { repo.names.collect { _polarNames.value = it } }
+        }
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _port.value = prefs.getInt(KEY_PORT, 10110)
         _bleAddress.value = prefs.getString(KEY_BLE_ADDRESS, "") ?: ""
@@ -321,6 +337,27 @@ class ServerViewModel : ViewModel() {
         _wifiEnabled.value = enabled
         service?.setWifiEnabled(enabled)
     }
+
+    fun setActivePolar(name: String) {
+        polarRepo?.setActive(name)
+    }
+
+    fun importPolar(uri: Uri, proposedName: String): Result<String> =
+        polarRepo?.import(uri, proposedName)
+            ?: Result.failure(IllegalStateException("polar repo not initialised"))
+
+    fun deletePolar(name: String) {
+        polarRepo?.delete(name)
+    }
+
+    fun savePolar(table: PolarTable): Result<Unit> =
+        polarRepo?.save(table) ?: Result.failure(IllegalStateException("polar repo not initialised"))
+
+    fun savePolarAs(newName: String, table: PolarTable): Result<String> =
+        polarRepo?.saveAs(newName, table) ?: Result.failure(IllegalStateException("polar repo not initialised"))
+
+    fun exportPolar(uri: Uri, table: PolarTable): Result<Unit> =
+        polarRepo?.export(uri, table) ?: Result.failure(IllegalStateException("polar repo not initialised"))
 
     fun stopServer(context: Context) {
         unbindService(context)

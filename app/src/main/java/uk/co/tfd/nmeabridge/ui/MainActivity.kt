@@ -23,7 +23,7 @@ class MainActivity : ComponentActivity() {
     private val viewModel: ServerViewModel by viewModels()
     private val bleTestViewModel: BleTestViewModel by viewModels()
 
-    private enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS }
+    private enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS, POLAR }
     private var currentScreen by mutableStateOf(Screen.NAV)
     private var pendingBleAction: (() -> Unit)? = null
 
@@ -73,7 +73,12 @@ class MainActivity : ComponentActivity() {
                             viewModel = viewModel,
                             onSettings = { currentScreen = Screen.SETTINGS },
                             onBattery = { currentScreen = Screen.BATTERY },
-                            onEngine = { currentScreen = Screen.ENGINE }
+                            onEngine = { currentScreen = Screen.ENGINE },
+                            onPolar = { currentScreen = Screen.POLAR }
+                        )
+                        Screen.POLAR -> PolarScreen(
+                            viewModel = viewModel,
+                            onBack = { currentScreen = Screen.NAV }
                         )
                         Screen.BATTERY -> BatteryScreen(
                             viewModel = viewModel,
