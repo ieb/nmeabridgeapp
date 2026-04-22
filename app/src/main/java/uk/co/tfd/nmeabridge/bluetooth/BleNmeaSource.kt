@@ -48,8 +48,18 @@ class BleNmeaSource(
         private const val MAGIC_AUTOPILOT: Byte = 0xAA.toByte()
         private const val MAGIC_AUTH_RESP: Byte = 0xAF.toByte()
         private const val CMD_AUTH: Byte = 0xF0.toByte()
+        private const val CMD_ENABLE_WIFI: Byte = 0x40.toByte()
+        private const val CMD_DISABLE_WIFI: Byte = 0x41.toByte()
 
         private const val RECONNECT_DELAY_MS = 3000L
+
+        // If no 0xFF01 nav frame arrives for this long, drop the last-known
+        // NavigationState so downstream consumers (UI, TCP output, derived
+        // performance) render "not available" instead of stale numbers.
+        // The BLE transport doc only specifies a firmware-side staleness
+        // timeout for engine (5 s -> NA), not for nav, so this watchdog
+        // covers the case where the firmware simply stops broadcasting.
+        private const val NAV_STALENESS_MS = 15_000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -85,6 +95,10 @@ class BleNmeaSource(
     private val frameBuffer = ByteArray(64)
     private var framePos = 0
 
+    private val navStaleRunnable = Runnable {
+        _navigationState.value = null
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -106,6 +120,11 @@ class BleNmeaSource(
                     commandChar = null
                     pendingGattOps.clear()
                     gattOpInFlight = false
+                    // Disconnect implies nav data is no longer valid. Drop it
+                    // now rather than waiting for the 15 s watchdog, so the
+                    // UI and TCP output reflect the lost link immediately.
+                    handler.removeCallbacks(navStaleRunnable)
+                    _navigationState.value = null
                     if (running) {
                         onConnectionStateChanged(false, "Reconnecting in 3s...")
                         handler.postDelayed({ doConnect() }, RECONNECT_DELAY_MS)
@@ -354,6 +373,39 @@ class BleNmeaSource(
         kickQueue()
     }
 
+    /**
+     * Send an enable/disable-WiFi command on the BoatWatch command characteristic
+     * (0xAA02). No-op if the source isn't yet connected and authenticated — the
+     * firmware requires prior auth on all 0xAA02 commands, and there is no
+     * response characteristic to confirm the WiFi state, so the caller tracks
+     * intent locally. Safe to call from any thread.
+     */
+    fun sendWifiCommand(enable: Boolean) {
+        handler.post { queueWifiCommand(enable) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun queueWifiCommand(enable: Boolean) {
+        val g = gatt ?: return
+        val c = commandChar ?: return
+        if (!authenticated) return
+        val cmdByte = if (enable) CMD_ENABLE_WIFI else CMD_DISABLE_WIFI
+        pendingGattOps.addLast {
+            val data = byteArrayOf(MAGIC_AUTOPILOT, cmdByte)
+            val ok = if (Build.VERSION.SDK_INT >= 33) {
+                g.writeCharacteristic(c, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                c.setValue(data)
+                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                @Suppress("DEPRECATION")
+                g.writeCharacteristic(c)
+            }
+            if (!ok) onGattOpCompleted()
+        }
+        kickQueue()
+    }
+
     @SuppressLint("MissingPermission")
     private fun sendAuthCommand(g: BluetoothGatt) {
         val cmd = commandChar ?: run {
@@ -403,6 +455,13 @@ class BleNmeaSource(
 
         // Publish navigation state for the UI
         _navigationState.value = nav
+
+        // Reset the staleness watchdog: another frame within NAV_STALENESS_MS
+        // keeps the state live; silence for longer triggers navStaleRunnable
+        // which clears _navigationState back to null. postDelayed/removeCallbacks
+        // must run on the main looper thread.
+        handler.removeCallbacks(navStaleRunnable)
+        handler.postDelayed(navStaleRunnable, NAV_STALENESS_MS)
 
         // Convert to NMEA sentences for TCP clients
         val sentences = BinaryProtocol.toNmeaSentences(nav)

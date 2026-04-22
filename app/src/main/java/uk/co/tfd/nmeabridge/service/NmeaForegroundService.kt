@@ -124,10 +124,11 @@ class NmeaForegroundService : Service() {
         // Collect navigation and battery state from BLE source
         if (source is BleNmeaSource) {
             serviceScope.launch {
+                // Forward nulls too: the BLE source emits null when it hasn't
+                // seen a nav frame for the staleness window, and the UI relies
+                // on navigationState going null to fall back to "---".
                 source.navigationState.collect { nav ->
-                    if (nav != null) {
-                        _state.update { it.copy(navigationState = nav) }
-                    }
+                    _state.update { it.copy(navigationState = nav) }
                 }
             }
             serviceScope.launch {
@@ -213,6 +214,15 @@ class NmeaForegroundService : Service() {
      */
     fun setEngineMonitoring(enabled: Boolean) {
         (nmeaSource as? BleNmeaSource)?.setEngineSubscribed(enabled)
+    }
+
+    /**
+     * Enable or disable the firmware's WiFi radio via the BoatWatch command
+     * characteristic (0xAA02). No-op when the current source is not a BLE
+     * source.
+     */
+    fun setWifiEnabled(enabled: Boolean) {
+        (nmeaSource as? BleNmeaSource)?.sendWifiCommand(enabled)
     }
 
     override fun onDestroy() {

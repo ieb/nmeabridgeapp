@@ -91,6 +91,12 @@ class ServerViewModel : ViewModel() {
     private val _bleScanning = MutableStateFlow(false)
     val bleScanning: StateFlow<Boolean> = _bleScanning.asStateFlow()
 
+    // Local UI-only state. The firmware exposes no WiFi-state read path on
+    // BLE, so the switch reflects the last intent issued by this client, not
+    // the actual firmware state.
+    private val _wifiEnabled = MutableStateFlow(false)
+    val wifiEnabled: StateFlow<Boolean> = _wifiEnabled.asStateFlow()
+
     private val handler = Handler(Looper.getMainLooper())
     private val seenBleAddresses = mutableSetOf<String>()
     private var savedBtAddress: String? = null
@@ -309,6 +315,11 @@ class ServerViewModel : ViewModel() {
 
     fun setEngineMonitoring(enabled: Boolean) {
         service?.setEngineMonitoring(enabled)
+    }
+
+    fun setWifiEnabled(enabled: Boolean) {
+        _wifiEnabled.value = enabled
+        service?.setWifiEnabled(enabled)
     }
 
     fun stopServer(context: Context) {

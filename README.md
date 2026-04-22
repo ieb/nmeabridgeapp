@@ -1,6 +1,18 @@
-# NMEA Bridge
+# NMEA Bridge.... that is more than a bridge.
 
 Android app for Chromebooks that receives navigation data from a BLE device using a compact binary protocol, converts it to NMEA0183 sentences, and re-broadcasts over a TCP server port. Other Android apps on the same Chromebook can connect to the TCP port and receive the NMEA stream. Also supports Bluetooth Classic SPP GPS receivers and a built-in simulator.
+
+But then it got extended.
+
+* Display navigation data on screen as it is recieved.
+* Derive data including performance data from a polar chart
+* Monitor and Graph BMS Data for a 4 cell LiFePO4 battery recieved over BLE
+* Monitor Engine data recieved over NMEA2000 on the firmware and sent over BLE
+* Graph Engine data over time.
+
+<img src="doc/screen-nav.png" alt="Nav Data" height="300"><img src="doc/screen-engine.png" alt="Engine" height="300"><img src="doc/screen-bms.png" alt="BMS" height="300"><img src="doc/screen-graphs.png" alt="Graphs" height="300"><img src="doc/screen-settings.png" alt="Settings" height="300">
+
+The app is not published to the playstore, to use you will need to build locally and load over ADB.
 
 ## Features
 
@@ -14,7 +26,7 @@ Android app for Chromebooks that receives navigation data from a BLE device usin
 
 ## Requirements
 
-- Android 8.0+ (API 26+)
+- Android 11.0+ (API 30+)
 - BLE Nav mode requires custom firmware (see N2KNMEA0183Wifi). Some older Chromebooks may not support BLE — use the BLE Test on the settings screen to verify.
 - For Bluetooth Classic mode: a Bluetooth SPP GPS receiver (e.g., Bad Elf, Garmin GLO, generic NMEA puck)
 

@@ -78,6 +78,12 @@ object BinaryProtocol {
 
     /**
      * Convert a NavigationState to NMEA 0183 sentences for TCP clients.
+     *
+     * Missing values propagate as empty fields between commas (NMEA 0183
+     * convention for "not available"), rather than being substituted with
+     * 0.0 — which would otherwise transmit a real numeric reading to
+     * downstream plotters when the source was actually unavailable. Whole
+     * sentences are suppressed when none of their non-time fields are known.
      */
     fun toNmeaSentences(nav: NavigationState): List<String> {
         val now = Date()
@@ -113,31 +119,38 @@ object BinaryProtocol {
                 "GPGLL,$latStr,$latDir,$lonStr,$lonDir,$time,A,A"
             ))
 
-            // RMC
-            val sogKn = nav.sog ?: 0.0
-            val cogDeg = nav.cog ?: 0.0
-            val magVar = nav.variation ?: 0.0
-            val varDir = if (magVar >= 0) "E" else "W"
+            // RMC — empty fields for missing sog/cog/variation
+            val sogStr = nav.sog?.let { "%.1f".format(it) } ?: ""
+            val cogStr = nav.cog?.let { "%.1f".format(it) } ?: ""
+            val varStr = nav.variation?.let { "%.1f".format(abs(it)) } ?: ""
+            val varDir = nav.variation?.let { if (it >= 0) "E" else "W" } ?: ""
             sentences.add(sentence(
                 "GPRMC,$time,A,$latStr,$latDir,$lonStr,$lonDir," +
-                        "%.1f,%.1f,$date,%.1f,$varDir,A".format(sogKn, cogDeg, abs(magVar))
-            ))
-
-            // VTG
-            val magCourse = ((cogDeg - magVar) + 360.0) % 360.0
-            val sogKmh = sogKn * 1.852
-            sentences.add(sentence(
-                "GPVTG,%.1f,T,%.1f,M,%.1f,N,%.1f,K,A".format(cogDeg, magCourse, sogKn, sogKmh)
+                        "$sogStr,$cogStr,$date,$varStr,$varDir,A"
             ))
         }
 
-        // ZDA
-        val nowDate = Date()
+        // VTG — position-independent; emit whenever cog or sog is known.
+        // Magnetic course needs both cog and variation, so it's empty when
+        // either is missing.
+        if (nav.cog != null || nav.sog != null) {
+            val cogStr = nav.cog?.let { "%.1f".format(it) } ?: ""
+            val magCourseStr = if (nav.cog != null && nav.variation != null) {
+                "%.1f".format(((nav.cog - nav.variation) + 360.0) % 360.0)
+            } else ""
+            val sogStr = nav.sog?.let { "%.1f".format(it) } ?: ""
+            val sogKmhStr = nav.sog?.let { "%.1f".format(it * 1.852) } ?: ""
+            sentences.add(sentence(
+                "GPVTG,$cogStr,T,$magCourseStr,M,$sogStr,N,$sogKmhStr,K,A"
+            ))
+        }
+
+        // ZDA — always emitted; the Android wall-clock is the time source.
         val dayFmt = SimpleDateFormat("dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
         val monthFmt = SimpleDateFormat("MM", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
         val yearFmt = SimpleDateFormat("yyyy", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
         sentences.add(sentence(
-            "GPZDA,$time,${dayFmt.format(nowDate)},${monthFmt.format(nowDate)},${yearFmt.format(nowDate)},00,00"
+            "GPZDA,$time,${dayFmt.format(now)},${monthFmt.format(now)},${yearFmt.format(now)},00,00"
         ))
 
         return sentences

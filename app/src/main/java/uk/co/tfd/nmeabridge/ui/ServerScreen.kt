@@ -31,6 +31,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -230,6 +231,39 @@ fun ServerScreen(
                     modifier = Modifier.padding(12.dp),
                     color = MaterialTheme.colorScheme.onErrorContainer
                 )
+            }
+        }
+
+        // Firmware WiFi toggle — only meaningful when the BLE BoatWatch
+        // service is connected and authenticated, since the 0xAA02 command
+        // characteristic is gated on auth. Show it only then, so users don't
+        // flip a disabled switch that does nothing.
+        if (serviceState.isRunning &&
+            sourceType == SourceType.BLE_GPS &&
+            serviceState.bluetoothConnected) {
+            val wifiEnabled by viewModel.wifiEnabled.collectAsState()
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Firmware WiFi", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Enable or disable the WiFi radio on the NMEA bridge firmware.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Switch(
+                        checked = wifiEnabled,
+                        onCheckedChange = { viewModel.setWifiEnabled(it) }
+                    )
+                }
             }
         }
 
