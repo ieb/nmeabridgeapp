@@ -37,6 +37,9 @@ class NmeaForegroundService : Service() {
     private val _state = MutableStateFlow(ServiceState())
     val state: StateFlow<ServiceState> = _state.asStateFlow()
 
+    private val _debug = MutableStateFlow(DebugState())
+    val debug: StateFlow<DebugState> = _debug.asStateFlow()
+
     private val nmeaFlow = MutableSharedFlow<String>(
         replay = 0,
         extraBufferCapacity = 64,
@@ -143,22 +146,20 @@ class NmeaForegroundService : Service() {
             }
         }
 
-        // Track sentences flowing through
+        // Track sentences flowing through. Lives in a dedicated DebugState so
+        // that non-debug screens don't recompose per sentence.
         serviceScope.launch {
             var count = 0L
+            val recent = ArrayDeque<String>(12)
             nmeaFlow.collect { sentence ->
                 count++
-                _state.update {
-                    val recent = it.recentSentences.let { list ->
-                        if (list.size >= 12) list.drop(1) + sentence
-                        else list + sentence
-                    }
-                    it.copy(
-                        lastSentence = sentence,
-                        recentSentences = recent,
-                        sentenceCount = count
-                    )
-                }
+                if (recent.size >= 12) recent.removeFirst()
+                recent.addLast(sentence)
+                _debug.value = DebugState(
+                    lastSentence = sentence,
+                    recentSentences = recent.toList(),
+                    sentenceCount = count
+                )
             }
         }
 

@@ -95,10 +95,20 @@ class EngineProtocolTest {
 
     @Test
     fun decode_largeEngineHoursIsUnsigned() {
-        // 0xFFFFFFFE = 4,294,967,294 seconds — just under the U32 max (not the sentinel).
+        // 0xFFFFFFFC = 4,294,967,292 seconds — just below the NMEA 2000
+        // reserved sentinel band (FFFD/FFFE/FFFF), so this is valid data.
+        val bytes = buildFrame(hoursSec = 0xFFFFFFFCL)
+        val e = EngineProtocol.decode(bytes)!!
+        assertEquals(0xFFFFFFFCL, e.engineHoursSec)
+    }
+
+    @Test
+    fun decode_engineHoursReservedBandIsNoData() {
+        // 0xFFFFFFFE is the "error" sentinel (one below N/A). NMEA 2000
+        // consumers treat the entire reserved band as no-data.
         val bytes = buildFrame(hoursSec = 0xFFFFFFFEL)
         val e = EngineProtocol.decode(bytes)!!
-        assertEquals(0xFFFFFFFEL, e.engineHoursSec)
+        assertNull(e.engineHoursSec)
     }
 
     @Test

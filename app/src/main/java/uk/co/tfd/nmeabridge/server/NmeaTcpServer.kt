@@ -3,6 +3,7 @@ package uk.co.tfd.nmeabridge.server
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -36,11 +37,46 @@ class NmeaTcpServer(
             try { server.close() } catch (_: IOException) {}
         }
 
+        // Reaper: probe every live client socket every REAP_INTERVAL_MS.
+        // sendUrgentData writes an OOB byte directly to the TCP stack; if the
+        // peer is gone (RST pending, no ACKs, half-open) this raises IOException
+        // promptly instead of waiting for the kernel keepalive (~2 h default on
+        // Linux). Most NMEA consumers discard OOB bytes, so this is safe.
+        scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(REAP_INTERVAL_MS)
+                val stale = mutableListOf<String>()
+                for ((id, entry) in clients) {
+                    try {
+                        entry.socket.sendUrgentData(0xFF)
+                    } catch (_: IOException) {
+                        stale += id
+                    } catch (_: Exception) {
+                        stale += id
+                    }
+                }
+                for (id in stale) {
+                    clients.remove(id)?.let { e ->
+                        try { e.socket.close() } catch (_: IOException) {}
+                        e.job.cancel()
+                    }
+                }
+                if (stale.isNotEmpty()) onClientCountChanged(clients.size)
+            }
+        }
+
         while (isActive) {
             try {
                 val clientSocket = server.accept()
                 clientSocket.tcpNoDelay = true
                 clientSocket.setSoLinger(true, 0) // RST on close for immediate notification
+                // Liveness: the TCP stack will probe an idle peer and surface
+                // EPIPE when the peer has gone away silently (process crashed,
+                // Wi-Fi dropped, ChromeOS container lost the app). Without
+                // this, a half-open socket can linger for many minutes,
+                // keeping a SharedFlow subscriber alive that drives per-sentence
+                // main-thread work for no reason.
+                clientSocket.keepAlive = true
 
                 val clientId = "${clientSocket.inetAddress.hostAddress}:${clientSocket.port}"
 
@@ -86,4 +122,8 @@ class NmeaTcpServer(
     }
 
     fun getClientCount(): Int = clients.size
+
+    companion object {
+        private const val REAP_INTERVAL_MS = 15_000L
+    }
 }

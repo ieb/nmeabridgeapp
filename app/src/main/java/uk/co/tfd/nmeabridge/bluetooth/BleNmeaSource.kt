@@ -53,13 +53,16 @@ class BleNmeaSource(
 
         private const val RECONNECT_DELAY_MS = 3000L
 
-        // If no 0xFF01 nav frame arrives for this long, drop the last-known
-        // NavigationState so downstream consumers (UI, TCP output, derived
-        // performance) render "not available" instead of stale numbers.
-        // The BLE transport doc only specifies a firmware-side staleness
-        // timeout for engine (5 s -> NA), not for nav, so this watchdog
-        // covers the case where the firmware simply stops broadcasting.
-        private const val NAV_STALENESS_MS = 15_000L
+        // Nav frames are published at 1 Hz. If none arrive for this long,
+        // treat the stream as stale: drop last-known NavigationState so
+        // downstream consumers render "not available" instead of frozen
+        // numbers, and flip the UI connection indicator to the
+        // "disconnected" colour so the stale condition is visible.
+        // Do NOT tear down GATT on nav silence — the NMEA 2000 bus can be
+        // off while BMS/engine data continue to flow over BLE, and a
+        // disconnect would lose their history. Reconnect is driven only by
+        // real link-layer STATE_DISCONNECTED events.
+        private const val NAV_STALENESS_MS = 5_000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -79,9 +82,13 @@ class BleNmeaSource(
     private var commandChar: BluetoothGattCharacteristic? = null
     private var batteryChar: BluetoothGattCharacteristic? = null
     private var engineChar: BluetoothGattCharacteristic? = null
-    @Volatile private var batteryWanted: Boolean = false
+    // Default to subscribed: we accumulate battery and engine history for
+    // as long as the source is running, so the UI can show it at any time.
+    // The screens previously toggled these on-demand via DisposableEffect,
+    // which meant history was lost every time the screen was left.
+    @Volatile private var batteryWanted: Boolean = true
     @Volatile private var batterySubscribed: Boolean = false
-    @Volatile private var engineWanted: Boolean = false
+    @Volatile private var engineWanted: Boolean = true
     @Volatile private var engineSubscribed: Boolean = false
     @Volatile private var authenticated: Boolean = false
 
@@ -96,6 +103,12 @@ class BleNmeaSource(
     private var framePos = 0
 
     private val navStaleRunnable = Runnable {
+        // Nav stream has been silent for NAV_STALENESS_MS. Clear nav state
+        // only — GATT stays up and battery / engine notifications can
+        // still arrive independently (BMS is on its own power rail). Nav
+        // staleness is communicated to the UI by _navigationState going
+        // null; the GATT-connected flag must stay true so screens that
+        // depend on non-nav data (BatteryScreen) keep rendering live.
         _navigationState.value = null
     }
 
@@ -121,8 +134,8 @@ class BleNmeaSource(
                     pendingGattOps.clear()
                     gattOpInFlight = false
                     // Disconnect implies nav data is no longer valid. Drop it
-                    // now rather than waiting for the 15 s watchdog, so the
-                    // UI and TCP output reflect the lost link immediately.
+                    // now rather than waiting for the staleness watchdog, so
+                    // the UI and TCP output reflect the lost link immediately.
                     handler.removeCallbacks(navStaleRunnable)
                     _navigationState.value = null
                     if (running) {
@@ -250,10 +263,12 @@ class BleNmeaSource(
      */
     @SuppressLint("MissingPermission")
     private fun enableNotifyOp(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-        g.setCharacteristicNotification(ch, true)
-        val desc = ch.getDescriptor(CCC_DESCRIPTOR_UUID)
-        if (desc == null || !writeCccDescriptor(g, desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
-            onGattOpCompleted()
+        safeGattOp(onFailure = {}) {
+            g.setCharacteristicNotification(ch, true)
+            val desc = ch.getDescriptor(CCC_DESCRIPTOR_UUID)
+            if (desc == null || !writeCccDescriptor(g, desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                onGattOpCompleted()
+            }
         }
     }
 
@@ -294,13 +309,37 @@ class BleNmeaSource(
         desc: BluetoothGattDescriptor,
         value: ByteArray = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
     ): Boolean {
-        return if (Build.VERSION.SDK_INT >= 33) {
-            g.writeDescriptor(desc, value) == BluetoothStatusCodes.SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            desc.setValue(value)
-            @Suppress("DEPRECATION")
-            g.writeDescriptor(desc)
+        // Guard every GATT call: the underlying BluetoothGatt binder can die
+        // (DeadObjectException) or refuse work in unexpected states
+        // (IllegalStateException). If we let those escape, the caller never
+        // calls onGattOpCompleted() and kickQueue() stalls forever — the
+        // queue holds gattOpInFlight=true and no further ops dispatch.
+        return try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                g.writeDescriptor(desc, value) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                desc.setValue(value)
+                @Suppress("DEPRECATION")
+                g.writeDescriptor(desc)
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Run a GATT op, clearing the in-flight flag on exception so the queue
+     * keeps moving. Also resets the "subscribed" intent flag the caller
+     * eagerly set, so a retry will re-attempt the subscription rather than
+     * short-circuiting as a no-op.
+     */
+    private inline fun safeGattOp(onFailure: () -> Unit, block: () -> Unit) {
+        try {
+            block()
+        } catch (_: Exception) {
+            onFailure()
+            onGattOpCompleted()
         }
     }
 
@@ -330,12 +369,14 @@ class BleNmeaSource(
         // see no change required, and return — leaving the subscription off.
         batterySubscribed = enabled
         pendingGattOps.addLast {
-            g.setCharacteristicNotification(c, enabled)
-            val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
-            val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-            if (desc == null || !writeCccDescriptor(g, desc, v)) {
-                onGattOpCompleted()
+            safeGattOp(onFailure = { batterySubscribed = !enabled }) {
+                g.setCharacteristicNotification(c, enabled)
+                val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
+                val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                if (desc == null || !writeCccDescriptor(g, desc, v)) {
+                    onGattOpCompleted()
+                }
             }
         }
         kickQueue()
@@ -362,12 +403,14 @@ class BleNmeaSource(
         // Eager flag update — see comment in applyBatterySubscription.
         engineSubscribed = enabled
         pendingGattOps.addLast {
-            g.setCharacteristicNotification(c, enabled)
-            val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
-            val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-            if (desc == null || !writeCccDescriptor(g, desc, v)) {
-                onGattOpCompleted()
+            safeGattOp(onFailure = { engineSubscribed = !enabled }) {
+                g.setCharacteristicNotification(c, enabled)
+                val desc = c.getDescriptor(CCC_DESCRIPTOR_UUID)
+                val v = if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                if (desc == null || !writeCccDescriptor(g, desc, v)) {
+                    onGattOpCompleted()
+                }
             }
         }
         kickQueue()
@@ -391,17 +434,19 @@ class BleNmeaSource(
         if (!authenticated) return
         val cmdByte = if (enable) CMD_ENABLE_WIFI else CMD_DISABLE_WIFI
         pendingGattOps.addLast {
-            val data = byteArrayOf(MAGIC_AUTOPILOT, cmdByte)
-            val ok = if (Build.VERSION.SDK_INT >= 33) {
-                g.writeCharacteristic(c, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
-            } else {
-                @Suppress("DEPRECATION")
-                c.setValue(data)
-                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                @Suppress("DEPRECATION")
-                g.writeCharacteristic(c)
+            safeGattOp(onFailure = {}) {
+                val data = byteArrayOf(MAGIC_AUTOPILOT, cmdByte)
+                val ok = if (Build.VERSION.SDK_INT >= 33) {
+                    g.writeCharacteristic(c, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    c.setValue(data)
+                    c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    @Suppress("DEPRECATION")
+                    g.writeCharacteristic(c)
+                }
+                if (!ok) onGattOpCompleted()
             }
-            if (!ok) onGattOpCompleted()
         }
         kickQueue()
     }
@@ -419,16 +464,18 @@ class BleNmeaSource(
             pinBytes.getOrElse(2) { '0'.code.toByte() },
             pinBytes.getOrElse(3) { '0'.code.toByte() }
         )
-        val ok = if (Build.VERSION.SDK_INT >= 33) {
-            g.writeCharacteristic(cmd, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            cmd.setValue(data)
-            cmd.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            @Suppress("DEPRECATION")
-            g.writeCharacteristic(cmd)
+        safeGattOp(onFailure = {}) {
+            val ok = if (Build.VERSION.SDK_INT >= 33) {
+                g.writeCharacteristic(cmd, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                cmd.setValue(data)
+                cmd.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                @Suppress("DEPRECATION")
+                g.writeCharacteristic(cmd)
+            }
+            if (!ok) onGattOpCompleted()
         }
-        if (!ok) onGattOpCompleted()
     }
 
     private fun processIncomingBytes(value: ByteArray) {
@@ -456,10 +503,10 @@ class BleNmeaSource(
         // Publish navigation state for the UI
         _navigationState.value = nav
 
-        // Reset the staleness watchdog: another frame within NAV_STALENESS_MS
-        // keeps the state live; silence for longer triggers navStaleRunnable
-        // which clears _navigationState back to null. postDelayed/removeCallbacks
-        // must run on the main looper thread.
+        // Reset the staleness watchdog: another nav frame within
+        // NAV_STALENESS_MS keeps the state live; silence triggers
+        // navStaleRunnable which clears the state and flips the indicator.
+        // postDelayed/removeCallbacks must run on the main looper thread.
         handler.removeCallbacks(navStaleRunnable)
         handler.postDelayed(navStaleRunnable, NAV_STALENESS_MS)
 
@@ -467,6 +514,7 @@ class BleNmeaSource(
         val sentences = BinaryProtocol.toNmeaSentences(nav)
         sentences.forEach { sink?.tryEmit(it) }
     }
+
 
     override suspend fun start(sink: MutableSharedFlow<String>) {
         this.sink = sink

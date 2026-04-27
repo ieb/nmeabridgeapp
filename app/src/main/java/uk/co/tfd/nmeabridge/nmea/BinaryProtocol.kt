@@ -17,11 +17,28 @@ object BinaryProtocol {
     private const val MAGIC: Byte = 0xCC.toByte()
     private const val FRAME_SIZE = 29
 
-    // NMEA 2000 "not available" sentinel values
-    private const val NA_U16 = 0xFFFF
-    private const val NA_U32 = 0xFFFFFFFF.toInt() // stored as int, compared unsigned
-    private const val NA_S16 = 0x7FFF.toShort()
-    private const val NA_S32 = 0x7FFFFFFF
+    // NMEA 2000 reserves the top of each range for non-data sentinels:
+    //   0xFFFF / 0x7FFF  — not available
+    //   0xFFFE / 0x7FFE  — out of range / error
+    //   0xFFFD / 0x7FFD  — reserved
+    // Firmware that clips an unrepresentable source value (e.g. -1E9 from a
+    // disconnected N2K depth transducer) produces 0xFFFE. Treat anything in
+    // the reserved band as no-data so the UI shows "—" instead of 655.3 m.
+    private const val RESERVED_U16_MIN = 0xFFFD
+    private const val RESERVED_U32_MIN = 0xFFFFFFFDL
+    private const val RESERVED_S16_MIN = 0x7FFD
+    private const val RESERVED_S32_MIN = 0x7FFFFFFD
+
+    private fun u16OrNull(raw: Int): Int? =
+        if (raw >= RESERVED_U16_MIN) null else raw
+    private fun u32OrNull(raw: Int): Long? {
+        val u = raw.toLong() and 0xFFFFFFFFL
+        return if (u >= RESERVED_U32_MIN) null else u
+    }
+    private fun s16OrNull(raw: Short): Int? =
+        if (raw.toInt() >= RESERVED_S16_MIN) null else raw.toInt()
+    private fun s32OrNull(raw: Int): Int? =
+        if (raw >= RESERVED_S32_MIN) null else raw
 
     private const val MS_TO_KNOTS = 1.0 / 0.514444
     private const val M_TO_NM = 1.0 / 1852.0
@@ -58,21 +75,21 @@ object BinaryProtocol {
         val logRaw = buf.int
 
         return NavigationState(
-            latitude = if (latRaw == NA_S32) null else latRaw / 1e7,
-            longitude = if (lonRaw == NA_S32) null else lonRaw / 1e7,
-            cog = if (cogRaw == NA_U16) null else cogRaw * 0.0001 * RAD_TO_DEG,
-            sog = if (sogRaw == NA_U16) null else sogRaw * 0.01 * MS_TO_KNOTS,
-            variation = if (varRaw == NA_S16) null else varRaw * 0.0001 * RAD_TO_DEG,
-            heading = if (hdgRaw == NA_U16) null else hdgRaw * 0.0001 * RAD_TO_DEG,
-            depth = if (depthRaw == NA_U16) null else depthRaw * 0.01,
-            awa = if (awaRaw == NA_U16) null else {
-                val deg = awaRaw * 0.0001 * RAD_TO_DEG
+            latitude = s32OrNull(latRaw)?.let { it / 1e7 },
+            longitude = s32OrNull(lonRaw)?.let { it / 1e7 },
+            cog = u16OrNull(cogRaw)?.let { it * 0.0001 * RAD_TO_DEG },
+            sog = u16OrNull(sogRaw)?.let { it * 0.01 * MS_TO_KNOTS },
+            variation = s16OrNull(varRaw)?.let { it * 0.0001 * RAD_TO_DEG },
+            heading = u16OrNull(hdgRaw)?.let { it * 0.0001 * RAD_TO_DEG },
+            depth = u16OrNull(depthRaw)?.let { it * 0.01 },
+            awa = u16OrNull(awaRaw)?.let {
+                val deg = it * 0.0001 * RAD_TO_DEG
                 // Convert 0-360 to ±180 (port negative, starboard positive)
                 if (deg > 180.0) deg - 360.0 else deg
             },
-            aws = if (awsRaw == NA_U16) null else awsRaw * 0.01 * MS_TO_KNOTS,
-            stw = if (stwRaw == NA_U16) null else stwRaw * 0.01 * MS_TO_KNOTS,
-            logNm = if (logRaw == NA_U32) null else (logRaw.toLong() and 0xFFFFFFFFL) * M_TO_NM,
+            aws = u16OrNull(awsRaw)?.let { it * 0.01 * MS_TO_KNOTS },
+            stw = u16OrNull(stwRaw)?.let { it * 0.01 * MS_TO_KNOTS },
+            logNm = u32OrNull(logRaw)?.let { it * M_TO_NM },
         )
     }
 

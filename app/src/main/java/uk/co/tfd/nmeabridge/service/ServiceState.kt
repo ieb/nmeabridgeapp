@@ -13,13 +13,21 @@ data class ServiceState(
     val bluetoothDeviceName: String = "",
     val bluetoothConnected: Boolean = false,
     val bluetoothStatus: String? = null,
-    val lastSentence: String = "",
-    val recentSentences: List<String> = emptyList(),
-    val sentenceCount: Long = 0,
     val navigationState: NavigationState? = null,
     val batteryState: BatteryState? = null,
     val engineState: EngineState? = null,
     val errorMessage: String? = null
+)
+
+/**
+ * Per-sentence debug info — updated on every NMEA sentence. Kept out of
+ * [ServiceState] so screens that don't display it don't recompose at
+ * sentence rate.
+ */
+data class DebugState(
+    val lastSentence: String = "",
+    val recentSentences: List<String> = emptyList(),
+    val sentenceCount: Long = 0
 )
 
 enum class SourceType {

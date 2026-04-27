@@ -49,6 +49,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceInfo
+import uk.co.tfd.nmeabridge.service.DebugState
 import uk.co.tfd.nmeabridge.service.ServiceState
 import uk.co.tfd.nmeabridge.service.SourceType
 
@@ -64,6 +65,7 @@ fun ServerScreen(
     onBack: () -> Unit = {}
 ) {
     val serviceState by viewModel.serviceState.collectAsState()
+    val debugState by viewModel.debugState.collectAsState()
     val port by viewModel.port.collectAsState()
     val sourceType by viewModel.sourceType.collectAsState()
     val selectedDevice by viewModel.selectedDevice.collectAsState()
@@ -269,12 +271,12 @@ fun ServerScreen(
 
         // Status card
         if (serviceState.isRunning) {
-            StatusCard(serviceState)
+            StatusCard(serviceState, debugState)
         }
 
         // NMEA output
-        if (serviceState.isRunning && serviceState.lastSentence.isNotEmpty()) {
-            NmeaOutputCard(serviceState)
+        if (serviceState.isRunning && debugState.lastSentence.isNotEmpty()) {
+            NmeaOutputCard(debugState)
         }
 
         // Connection instructions
@@ -326,7 +328,7 @@ private fun StatusDot(isRunning: Boolean) {
 }
 
 @Composable
-private fun StatusCard(state: ServiceState) {
+private fun StatusCard(state: ServiceState, debug: DebugState) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(12.dp),
@@ -347,7 +349,7 @@ private fun StatusCard(state: ServiceState) {
             }
             StatusRow("Server", "${state.serverAddress}:${state.port}")
             StatusRow("Clients", state.connectedClients.toString())
-            StatusRow("Sentences", state.sentenceCount.toString())
+            StatusRow("Sentences", debug.sentenceCount.toString())
         }
     }
 }
@@ -369,7 +371,7 @@ private fun StatusRow(label: String, value: String) {
 }
 
 @Composable
-private fun NmeaOutputCard(state: ServiceState) {
+private fun NmeaOutputCard(state: DebugState) {
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
 
     // Auto-scroll to bottom when new sentences arrive

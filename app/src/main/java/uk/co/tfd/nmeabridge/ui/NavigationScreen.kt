@@ -216,13 +216,20 @@ fun NavigationScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Connection indicator
+                // Connection indicator. Three states:
+                //   green  — GATT connected AND nav stream live
+                //   amber  — GATT connected but nav stream stale (e.g. N2K
+                //            bus off); battery/engine may still be live
+                //   grey   — server stopped
+                val navLive = nav != null
+                val linkUp = state.bluetoothConnected ||
+                    state.sourceType == uk.co.tfd.nmeabridge.service.SourceType.SIMULATOR
                 Box(
                     modifier = Modifier
                         .size(10.dp)
                         .clip(CircleShape)
                         .background(
-                            if (state.isRunning && (state.bluetoothConnected || state.sourceType == uk.co.tfd.nmeabridge.service.SourceType.SIMULATOR))
+                            if (state.isRunning && linkUp && navLive)
                                 Color(0xFF4CAF50)
                             else if (state.isRunning)
                                 Color(0xFFFFA000)

@@ -49,11 +49,6 @@ fun BatteryScreen(
     viewModel: ServerViewModel,
     onBack: () -> Unit
 ) {
-    DisposableEffect(Unit) {
-        viewModel.setBatteryMonitoring(true)
-        onDispose { viewModel.setBatteryMonitoring(false) }
-    }
-
     val state by viewModel.serviceState.collectAsState()
     val history by viewModel.batteryHistory.collectAsState()
     val battery = state.batteryState

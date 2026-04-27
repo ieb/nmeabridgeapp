@@ -22,13 +22,14 @@ import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceInfo
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
 import uk.co.tfd.nmeabridge.nmea.PolarRepository
 import uk.co.tfd.nmeabridge.nmea.PolarTable
+import uk.co.tfd.nmeabridge.service.DebugState
 import uk.co.tfd.nmeabridge.service.NmeaForegroundService
 import uk.co.tfd.nmeabridge.service.ServiceState
 import uk.co.tfd.nmeabridge.service.SourceType
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class BatterySample(val tMs: Long, val v: Float, val i: Float)
@@ -43,6 +44,10 @@ data class EngineSample(
 
 private const val BATTERY_HISTORY_MAX_MS = 12L * 3600 * 1000
 private const val ENGINE_HISTORY_MAX_MS = 6L * 3600 * 1000
+// Cap how often we publish a fresh history snapshot to the UI. Samples are
+// still captured internally; only the StateFlow emission (and the resulting
+// recomposition) is throttled.
+private const val HISTORY_PUBLISH_INTERVAL_MS = 1000L
 
 data class BleScannedDevice(
     val name: String,
@@ -63,6 +68,9 @@ class ServerViewModel : ViewModel() {
 
     private val _serviceState = MutableStateFlow(ServiceState())
     val serviceState: StateFlow<ServiceState> = _serviceState.asStateFlow()
+
+    private val _debugState = MutableStateFlow(DebugState())
+    val debugState: StateFlow<DebugState> = _debugState.asStateFlow()
 
     private val _batteryHistory = MutableStateFlow<List<BatterySample>>(emptyList())
     val batteryHistory: StateFlow<List<BatterySample>> = _batteryHistory.asStateFlow()
@@ -137,55 +145,69 @@ class ServerViewModel : ViewModel() {
     private var service: NmeaForegroundService? = null
     private var bound = false
 
+    // Ring buffers used by the background collector. O(1) append/trim, and
+    // we only publish a new immutable snapshot to the StateFlow at most
+    // HISTORY_PUBLISH_INTERVAL_MS so the UI doesn't recompose per sentence.
+    private val batteryRing = ArrayDeque<BatterySample>()
+    private val engineRing = ArrayDeque<EngineSample>()
+    private var lastBatteryPublishMs = 0L
+    private var lastEnginePublishMs = 0L
+
     init {
-        viewModelScope.launch {
+        // Run OFF the main dispatcher: the per-sentence update work (de-dup,
+        // trim, snapshot) was previously done on Main and was the dominant
+        // cause of UI-thread stalls / ANRs. StateFlow is thread-safe, so UI
+        // collectors still receive updates correctly.
+        viewModelScope.launch(Dispatchers.Default) {
             _serviceState.collect { st ->
                 val now = System.currentTimeMillis()
 
-                // Battery history
                 val b = st.batteryState
                 if (b != null) {
-                    val cutoff = now - BATTERY_HISTORY_MAX_MS
-                    _batteryHistory.update { list ->
-                        val trimmed = if (list.isEmpty() || list.first().tMs >= cutoff) list
-                                      else list.dropWhile { it.tMs < cutoff }
-                        val last = trimmed.lastOrNull()
-                        // De-dup: avoid pushing an identical sample when the StateFlow
-                        // re-emits for unrelated reasons (e.g. ServiceState copy-update).
-                        if (last != null &&
-                            last.v == b.packV.toFloat() &&
-                            last.i == b.currentA.toFloat() &&
-                            now - last.tMs < 500) {
-                            trimmed
-                        } else {
-                            trimmed + BatterySample(now, b.packV.toFloat(), b.currentA.toFloat())
+                    val v = b.packV.toFloat()
+                    val i = b.currentA.toFloat()
+                    val last = batteryRing.lastOrNull()
+                    val dup = last != null && last.v == v && last.i == i &&
+                              now - last.tMs < 500
+                    if (!dup) {
+                        batteryRing.addLast(BatterySample(now, v, i))
+                        val cutoff = now - BATTERY_HISTORY_MAX_MS
+                        while (batteryRing.isNotEmpty() && batteryRing.first().tMs < cutoff) {
+                            batteryRing.removeFirst()
+                        }
+                        if (now - lastBatteryPublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+                            lastBatteryPublishMs = now
+                            _batteryHistory.value = batteryRing.toList()
                         }
                     }
                 }
 
-                // Engine history (RPM, coolant, exhaust, alternator-temp trace)
                 val e = st.engineState
                 if (e != null) {
-                    val cutoff = now - ENGINE_HISTORY_MAX_MS
-                    _engineHistory.update { list ->
-                        val trimmed = if (list.isEmpty() || list.first().tMs >= cutoff) list
-                                      else list.dropWhile { it.tMs < cutoff }
-                        val last = trimmed.lastOrNull()
-                        if (last != null &&
-                            last.rpm == e.rpm &&
-                            last.coolantC == e.coolantC &&
-                            last.exhaustC == e.exhaustC &&
-                            last.alternatorC == e.alternatorC &&
-                            now - last.tMs < 500) {
-                            trimmed
-                        } else {
-                            trimmed + EngineSample(
+                    val last = engineRing.lastOrNull()
+                    val dup = last != null &&
+                              last.rpm == e.rpm &&
+                              last.coolantC == e.coolantC &&
+                              last.exhaustC == e.exhaustC &&
+                              last.alternatorC == e.alternatorC &&
+                              now - last.tMs < 500
+                    if (!dup) {
+                        engineRing.addLast(
+                            EngineSample(
                                 tMs = now,
                                 rpm = e.rpm,
                                 coolantC = e.coolantC,
                                 exhaustC = e.exhaustC,
                                 alternatorC = e.alternatorC
                             )
+                        )
+                        val cutoff = now - ENGINE_HISTORY_MAX_MS
+                        while (engineRing.isNotEmpty() && engineRing.first().tMs < cutoff) {
+                            engineRing.removeFirst()
+                        }
+                        if (now - lastEnginePublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+                            lastEnginePublishMs = now
+                            _engineHistory.value = engineRing.toList()
                         }
                     }
                 }
@@ -199,6 +221,9 @@ class ServerViewModel : ViewModel() {
             bound = true
             viewModelScope.launch {
                 service!!.state.collect { _serviceState.value = it }
+            }
+            viewModelScope.launch {
+                service!!.debug.collect { _debugState.value = it }
             }
         }
 

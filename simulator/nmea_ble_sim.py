@@ -22,7 +22,10 @@ import asyncio
 import math
 import random
 import struct
+import sys
+import termios
 import time
+import tty
 from typing import Optional
 
 from ble_server import BleGattServer, GATTCharacteristic
@@ -111,13 +114,26 @@ def pack_nav_state(
     sog_ms: float,
     variation_deg: float,
     heading_deg: float,
-    depth_m: float,
+    depth_m: Optional[float],
     awa_deg: float,
     aws_ms: float,
     stw_ms: float,
     log_m: int,
+    depth_raw: Optional[int] = None,
 ) -> bytearray:
-    """29-byte Navigation State frame (magic 0xCC)."""
+    """29-byte Navigation State frame (magic 0xCC).
+
+    depth_m is the normal float path. Pass depth_raw to force a specific
+    u16 into the depth field — used by the simulator to emit the NMEA 2000
+    reserved sentinels (0xFFFD / 0xFFFE / 0xFFFF) for consumer testing.
+    depth_raw takes precedence when provided.
+    """
+    if depth_raw is not None:
+        depth_u16 = depth_raw & 0xFFFF
+    elif depth_m is None:
+        depth_u16 = NA_U16
+    else:
+        depth_u16 = min(int(round(depth_m / 0.01)), 0xFFFC)
     return bytearray(struct.pack(
         "<BiiHHhHHHHHI",
         MAGIC_NAV,
@@ -127,7 +143,7 @@ def pack_nav_state(
         _speed_ms_to_u16(sog_ms),
         _deg_to_rad_s16(variation_deg),
         _deg_to_rad_u16(heading_deg),
-        min(int(round(depth_m / 0.01)), 0xFFFE),
+        depth_u16,
         _deg_to_rad_u16(awa_deg),
         _speed_ms_to_u16(aws_ms),
         _speed_ms_to_u16(stw_ms),
@@ -319,6 +335,13 @@ class Simulator:
         self.battery_remaining = 78.0
         self.battery_cycles = 42
 
+        # Simulated NMEA 2000 bus power. When off, the notify loops keep
+        # running but skip all notify() calls — the central sees an
+        # authenticated but idle link, reproducing the "no data" condition
+        # that makes Navionics open repeated TCP connections against the
+        # app's NMEA-over-TCP server.
+        self.bus_on = True
+
     # ---- write handler ----
     def _on_write(self, char_uuid: str, data: bytes):
         if char_uuid.lower() == BW_COMMAND_UUID.lower():
@@ -352,6 +375,18 @@ class Simulator:
     # ---- notify loops ----
     async def nav_loop(self):
         tick = 0
+        # Rotate the depth field through a normal value and each of the
+        # three NMEA 2000 reserved sentinels, DEPTH_STAGE_SECONDS each.
+        # Lets us confirm downstream consumers (the Android app, Raymarine
+        # plotters) render "—" / blank instead of a spurious 655.3 m.
+        depth_stages = [
+            ("normal",       None),    # use the real sinusoidal depth
+            ("N/A (0xFFFF)", 0xFFFF),
+            ("error (0xFFFE)", 0xFFFE),
+            ("out-of-range (0xFFFD)", 0xFFFD),
+        ]
+        DEPTH_STAGE_SECONDS = 15
+        last_depth_stage = -1
         while True:
             lat = self.args.lat + self.radius * math.cos(math.radians(self.bearing))
             lon = self.args.lon + self.radius * math.sin(math.radians(self.bearing))
@@ -359,6 +394,12 @@ class Simulator:
             awa_deg = 45.0 + 10.0 * math.sin(math.radians(self.bearing * 0.5))
             aws_ms = 8.0 + 1.5 * math.sin(math.radians(self.bearing))
             self.log_m += int(round(self.sog_ms))
+
+            stage = (tick // DEPTH_STAGE_SECONDS) % len(depth_stages)
+            stage_label, depth_raw = depth_stages[stage]
+            if stage != last_depth_stage:
+                last_depth_stage = stage
+                print(f"[DEPTH] stage {stage}/{len(depth_stages) - 1}: {stage_label}")
 
             frame = pack_nav_state(
                 lat=lat, lon=lon,
@@ -369,12 +410,15 @@ class Simulator:
                 awa_deg=awa_deg, aws_ms=aws_ms,
                 stw_ms=self.stw_ms,
                 log_m=self.log_m,
+                depth_raw=depth_raw,
             )
-            if self.authenticated and self.server.has_subscribers(self.nav_char):
+            if self.bus_on and self.authenticated and self.server.has_subscribers(self.nav_char):
                 self.server.notify(self.nav_char, frame)
                 if tick % 10 == 0:
+                    depth_str = f"{depth:.1f}m" if depth_raw is None else f"[{stage_label}]"
                     print(f"[TX-NAV] LAT={lat:.5f} LON={lon:.5f} "
-                          f"COG={self.bearing:.0f}° SOG={self.args.speed:.1f}kn")
+                          f"COG={self.bearing:.0f}° SOG={self.args.speed:.1f}kn "
+                          f"DEPTH={depth_str}")
             self.bearing = (self.bearing + 3.6) % 360.0
             tick += 1
             await asyncio.sleep(1.0)
@@ -439,7 +483,7 @@ class Simulator:
                 status1=status1,
                 status2=status2,
             )
-            if self.authenticated and self.server.has_subscribers(self.engine_char):
+            if self.bus_on and self.authenticated and self.server.has_subscribers(self.engine_char):
                 self.server.notify(self.engine_char, frame)
                 if tick % 5 == 0:
                     rpm_s = f"{rpm:.0f}" if rpm is not None else "—"
@@ -474,6 +518,9 @@ class Simulator:
                 cells_v=cells,
                 ntc_c=ntcs,
             )
+            # Battery (BMS) is independent of the NMEA 2000 bus — it runs
+            # off the BoatWatch board and continues to publish even when
+            # the bus is off. So do NOT gate this loop on self.bus_on.
             if self.authenticated and self.server.has_subscribers(self.battery_char):
                 self.server.notify(self.battery_char, frame)
                 cell_mv = [int(c * 1000) for c in cells]
@@ -489,9 +536,45 @@ class Simulator:
                 target_hdg_deg=self.bearing,
                 target_wind_deg=0.0,
             )
-            if self.authenticated and self.server.has_subscribers(self.autopilot_char):
+            if self.bus_on and self.authenticated and self.server.has_subscribers(self.autopilot_char):
                 self.server.notify(self.autopilot_char, frame)
             await asyncio.sleep(5.0)
+
+    async def key_loop(self):
+        """Listen on stdin for single keypresses:
+            's' — toggle the simulated NMEA 2000 bus on/off
+            'q' — quit
+
+        Uses cbreak mode so keys are read without requiring Enter. If stdin
+        is not a TTY (e.g. launched under a non-interactive wrapper) this
+        coroutine exits immediately and the simulator runs normally.
+        """
+        if not sys.stdin.isatty():
+            return
+        loop = asyncio.get_running_loop()
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(reader)
+            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+            print("[KEY] Press 's' to toggle bus on/off, 'q' to quit.")
+            while True:
+                ch = await reader.read(1)
+                if not ch:
+                    return
+                c = ch.decode(errors="replace").lower()
+                if c == "s":
+                    self.bus_on = not self.bus_on
+                    print(f"[BUS] Simulated NMEA 2000 bus now "
+                          f"{'ON' if self.bus_on else 'OFF'}")
+                elif c == "q":
+                    print("[KEY] Quit requested.")
+                    asyncio.get_running_loop().stop()
+                    return
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
     async def run(self):
         await self.server.start()
@@ -525,6 +608,7 @@ class Simulator:
                 self.engine_loop(),
                 self.battery_loop(),
                 self.autopilot_loop(),
+                self.key_loop(),
             )
         except asyncio.CancelledError:
             pass

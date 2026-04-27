@@ -37,11 +37,6 @@ fun EngineScreen(
     onBack: () -> Unit,
     onGraphs: () -> Unit
 ) {
-    DisposableEffect(Unit) {
-        viewModel.setEngineMonitoring(true)
-        onDispose { viewModel.setEngineMonitoring(false) }
-    }
-
     val state by viewModel.serviceState.collectAsState()
     // Render dials and tiles even before the first engine packet arrives: an
     // empty EngineState has all-null fields, which the dials display as "— —"

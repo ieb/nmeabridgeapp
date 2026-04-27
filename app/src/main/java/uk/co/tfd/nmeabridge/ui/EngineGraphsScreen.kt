@@ -51,14 +51,6 @@ fun EngineGraphsScreen(
     viewModel: ServerViewModel,
     onBack: () -> Unit
 ) {
-    // Keep engine characteristic subscribed while this screen is visible. The
-    // service keeps the TCP server running independently, so navigation data
-    // continues to flow to downstream clients.
-    DisposableEffect(Unit) {
-        viewModel.setEngineMonitoring(true)
-        onDispose { viewModel.setEngineMonitoring(false) }
-    }
-
     val state by viewModel.serviceState.collectAsState()
     val history by viewModel.engineHistory.collectAsState()
 
