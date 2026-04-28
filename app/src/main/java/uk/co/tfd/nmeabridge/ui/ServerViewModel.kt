@@ -20,6 +20,11 @@ import android.net.Uri
 import uk.co.tfd.nmeabridge.bluetooth.BleNmeaSource
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceInfo
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
+import uk.co.tfd.nmeabridge.history.FrameRing
+import uk.co.tfd.nmeabridge.history.RingSnapshot
+import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
+import uk.co.tfd.nmeabridge.nmea.BmsProtocol
+import uk.co.tfd.nmeabridge.nmea.EngineProtocol
 import uk.co.tfd.nmeabridge.nmea.PolarRepository
 import uk.co.tfd.nmeabridge.nmea.PolarTable
 import uk.co.tfd.nmeabridge.service.DebugState
@@ -27,32 +32,53 @@ import uk.co.tfd.nmeabridge.service.NmeaForegroundService
 import uk.co.tfd.nmeabridge.service.ServiceState
 import uk.co.tfd.nmeabridge.service.SourceType
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-data class BatterySample(val tMs: Long, val v: Float, val i: Float)
+// History ring capacities: 12 h at 1 Hz = 43 200 frames. The BMS source
+// publishes at 0.2 Hz in practice, so the BMS ring holds ~60 h of data at
+// that rate — still well under 1 MB for a 48 B fixed slot.
+private const val HISTORY_CAPACITY = 43_200
 
-data class EngineSample(
-    val tMs: Long,
-    val rpm: Int?,
-    val coolantC: Double?,
-    val exhaustC: Double?,
-    val alternatorC: Double?
-)
-
-private const val BATTERY_HISTORY_MAX_MS = 12L * 3600 * 1000
-private const val ENGINE_HISTORY_MAX_MS = 6L * 3600 * 1000
-// Cap how often we publish a fresh history snapshot to the UI. Samples are
-// still captured internally; only the StateFlow emission (and the resulting
-// recomposition) is throttled.
+// Cap how often we publish a fresh RingSnapshot to the UI. Append into
+// the ring happens on every BLE notification; only the StateFlow emission
+// (and the resulting Compose recomposition) is throttled.
 private const val HISTORY_PUBLISH_INTERVAL_MS = 1000L
+
+// Target cadence for the history rings. Every HISTORY_TICK_MS a background
+// ticker tops up each ring with a sentinel frame (all-0xFF data) if no
+// real frame has arrived within the grace window. Keeps the time axis
+// contiguous so chart lines show gaps when the stream dies instead of
+// holding the last value until the next real sample arrives.
+private const val HISTORY_TICK_MS = 1000L
+// If no real frame arrived within this window, the ticker inserts a
+// sentinel. Set slightly above the nominal 1 Hz cadence so ordinary jitter
+// doesn't trigger spurious gaps.
+private const val HISTORY_GAP_THRESHOLD_MS = 1_500L
+
+// BMS cadence is much slower in practice (~5 s from the BoatWatch firmware
+// and the Python simulator). Threshold has to exceed the real cadence
+// plus jitter, otherwise the ticker inserts a sentinel between every pair
+// of real frames and the chart line breaks visibly even while data is
+// flowing.
+private const val BATTERY_GAP_THRESHOLD_MS = 15_000L
 
 data class BleScannedDevice(
     val name: String,
     val address: String
 )
+
+/**
+ * The currently-displayed top-level screen. Stored on the ViewModel so it
+ * survives Activity recreation (ChromeOS/ARC++ tears down and rebuilds
+ * the Activity on window focus changes without killing the process, which
+ * would otherwise reset the user to NAV every time they Alt-Tab back).
+ */
+enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS, POLAR }
 
 class ServerViewModel : ViewModel() {
 
@@ -72,11 +98,36 @@ class ServerViewModel : ViewModel() {
     private val _debugState = MutableStateFlow(DebugState())
     val debugState: StateFlow<DebugState> = _debugState.asStateFlow()
 
-    private val _batteryHistory = MutableStateFlow<List<BatterySample>>(emptyList())
-    val batteryHistory: StateFlow<List<BatterySample>> = _batteryHistory.asStateFlow()
+    private val _currentScreen = MutableStateFlow(Screen.NAV)
+    val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
 
-    private val _engineHistory = MutableStateFlow<List<EngineSample>>(emptyList())
-    val engineHistory: StateFlow<List<EngineSample>> = _engineHistory.asStateFlow()
+    fun setCurrentScreen(s: Screen) { _currentScreen.value = s }
+
+    // Wire-format history rings. Chart code reads these via per-field
+    // accessors in nmea/BinaryProtocol.kt / EngineProtocol.kt / BmsProtocol.kt.
+    // Nav has no chart consumer today but is populated so future screens
+    // (polar track, depth log) have history available.
+    private val navRing = FrameRing(
+        frameSize = BinaryProtocol.FRAME_SIZE,
+        capacity = HISTORY_CAPACITY,
+    )
+    private val engineRing = FrameRing(
+        frameSize = EngineProtocol.FRAME_SIZE,
+        capacity = HISTORY_CAPACITY,
+    )
+    private val batteryRing = FrameRing(
+        frameSize = BmsProtocol.HISTORY_SLOT_SIZE,
+        capacity = HISTORY_CAPACITY,
+    )
+
+    private val _navHistory = MutableStateFlow(RingSnapshot.EMPTY)
+    val navHistory: StateFlow<RingSnapshot> = _navHistory.asStateFlow()
+
+    private val _engineHistory = MutableStateFlow(RingSnapshot.EMPTY)
+    val engineHistory: StateFlow<RingSnapshot> = _engineHistory.asStateFlow()
+
+    private val _batteryHistory = MutableStateFlow(RingSnapshot.EMPTY)
+    val batteryHistory: StateFlow<RingSnapshot> = _batteryHistory.asStateFlow()
 
     private val _port = MutableStateFlow(10110)
     val port: StateFlow<Int> = _port.asStateFlow()
@@ -145,71 +196,99 @@ class ServerViewModel : ViewModel() {
     private var service: NmeaForegroundService? = null
     private var bound = false
 
-    // Ring buffers used by the background collector. O(1) append/trim, and
-    // we only publish a new immutable snapshot to the StateFlow at most
-    // HISTORY_PUBLISH_INTERVAL_MS so the UI doesn't recompose per sentence.
-    private val batteryRing = ArrayDeque<BatterySample>()
-    private val engineRing = ArrayDeque<EngineSample>()
-    private var lastBatteryPublishMs = 0L
+    private var lastNavPublishMs = 0L
     private var lastEnginePublishMs = 0L
+    private var lastBatteryPublishMs = 0L
+
+    // Timestamp of the most recent *real* append per stream. The gap-filler
+    // ticker compares against these to decide whether silence has passed
+    // and a sentinel should be inserted. @Volatile: written from the flow
+    // collectors, read from the ticker, both on Dispatchers.Default.
+    @Volatile private var lastNavAppendMs = 0L
+    @Volatile private var lastEngineAppendMs = 0L
+    @Volatile private var lastBatteryAppendMs = 0L
+
+    /**
+     * Append a raw nav wire frame (29 B, magic 0xCC) to the history ring
+     * and republish a new RingSnapshot at most HISTORY_PUBLISH_INTERVAL_MS.
+     * Runs on the collector coroutine (Dispatchers.Default).
+     */
+    private fun appendNav(frame: ByteArray) {
+        if (frame.size != BinaryProtocol.FRAME_SIZE) return
+        val now = System.currentTimeMillis()
+        navRing.append(now, frame)
+        lastNavAppendMs = now
+        if (now - lastNavPublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+            lastNavPublishMs = now
+            _navHistory.value = navRing.snapshot()
+        }
+    }
+
+    private fun appendEngine(frame: ByteArray) {
+        if (frame.size != EngineProtocol.FRAME_SIZE) return
+        val now = System.currentTimeMillis()
+        engineRing.append(now, frame)
+        lastEngineAppendMs = now
+        if (now - lastEnginePublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+            lastEnginePublishMs = now
+            _engineHistory.value = engineRing.snapshot()
+        }
+    }
+
+    private fun appendBattery(wireFrame: ByteArray) {
+        val slot = BmsProtocol.encodeHistorySlot(wireFrame) ?: return
+        val now = System.currentTimeMillis()
+        batteryRing.append(now, slot)
+        lastBatteryAppendMs = now
+        if (now - lastBatteryPublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+            lastBatteryPublishMs = now
+            _batteryHistory.value = batteryRing.snapshot()
+        }
+    }
+
+    /**
+     * Append a sentinel frame + republish snapshot. Used by the gap-filler
+     * to keep the time axis contiguous when the source stream has stopped.
+     * Doesn't update lastXxxAppendMs — the stream is still silent.
+     */
+    private fun appendNavSentinel(now: Long) {
+        navRing.append(now, BinaryProtocol.SENTINEL_FRAME)
+        lastNavPublishMs = now
+        _navHistory.value = navRing.snapshot()
+    }
+
+    private fun appendEngineSentinel(now: Long) {
+        engineRing.append(now, EngineProtocol.SENTINEL_FRAME)
+        lastEnginePublishMs = now
+        _engineHistory.value = engineRing.snapshot()
+    }
+
+    private fun appendBatterySentinel(now: Long) {
+        batteryRing.append(now, BmsProtocol.SENTINEL_SLOT)
+        lastBatteryPublishMs = now
+        _batteryHistory.value = batteryRing.snapshot()
+    }
 
     init {
-        // Run OFF the main dispatcher: the per-sentence update work (de-dup,
-        // trim, snapshot) was previously done on Main and was the dominant
-        // cause of UI-thread stalls / ANRs. StateFlow is thread-safe, so UI
-        // collectors still receive updates correctly.
+        // Gap-filler ticker. Wakes every HISTORY_TICK_MS and inserts a
+        // sentinel into any stream that has been silent longer than
+        // HISTORY_GAP_THRESHOLD_MS. Only runs once there's been at least
+        // one real sample on that stream — no point filling sentinels for
+        // streams the peripheral never populates (e.g. engine on a non-
+        // BoatWatch source). viewModelScope tears this down when the VM
+        // is cleared.
         viewModelScope.launch(Dispatchers.Default) {
-            _serviceState.collect { st ->
+            while (isActive) {
+                delay(HISTORY_TICK_MS)
                 val now = System.currentTimeMillis()
-
-                val b = st.batteryState
-                if (b != null) {
-                    val v = b.packV.toFloat()
-                    val i = b.currentA.toFloat()
-                    val last = batteryRing.lastOrNull()
-                    val dup = last != null && last.v == v && last.i == i &&
-                              now - last.tMs < 500
-                    if (!dup) {
-                        batteryRing.addLast(BatterySample(now, v, i))
-                        val cutoff = now - BATTERY_HISTORY_MAX_MS
-                        while (batteryRing.isNotEmpty() && batteryRing.first().tMs < cutoff) {
-                            batteryRing.removeFirst()
-                        }
-                        if (now - lastBatteryPublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
-                            lastBatteryPublishMs = now
-                            _batteryHistory.value = batteryRing.toList()
-                        }
-                    }
+                if (lastNavAppendMs > 0 && now - lastNavAppendMs >= HISTORY_GAP_THRESHOLD_MS) {
+                    appendNavSentinel(now)
                 }
-
-                val e = st.engineState
-                if (e != null) {
-                    val last = engineRing.lastOrNull()
-                    val dup = last != null &&
-                              last.rpm == e.rpm &&
-                              last.coolantC == e.coolantC &&
-                              last.exhaustC == e.exhaustC &&
-                              last.alternatorC == e.alternatorC &&
-                              now - last.tMs < 500
-                    if (!dup) {
-                        engineRing.addLast(
-                            EngineSample(
-                                tMs = now,
-                                rpm = e.rpm,
-                                coolantC = e.coolantC,
-                                exhaustC = e.exhaustC,
-                                alternatorC = e.alternatorC
-                            )
-                        )
-                        val cutoff = now - ENGINE_HISTORY_MAX_MS
-                        while (engineRing.isNotEmpty() && engineRing.first().tMs < cutoff) {
-                            engineRing.removeFirst()
-                        }
-                        if (now - lastEnginePublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
-                            lastEnginePublishMs = now
-                            _engineHistory.value = engineRing.toList()
-                        }
-                    }
+                if (lastEngineAppendMs > 0 && now - lastEngineAppendMs >= HISTORY_GAP_THRESHOLD_MS) {
+                    appendEngineSentinel(now)
+                }
+                if (lastBatteryAppendMs > 0 && now - lastBatteryAppendMs >= BATTERY_GAP_THRESHOLD_MS) {
+                    appendBatterySentinel(now)
                 }
             }
         }
@@ -224,6 +303,17 @@ class ServerViewModel : ViewModel() {
             }
             viewModelScope.launch {
                 service!!.debug.collect { _debugState.value = it }
+            }
+            // History ingest runs OFF the main dispatcher: append + snapshot
+            // allocations must not block Compose frame production.
+            viewModelScope.launch(Dispatchers.Default) {
+                service!!.rawNavFrames.collect { appendNav(it) }
+            }
+            viewModelScope.launch(Dispatchers.Default) {
+                service!!.rawEngineFrames.collect { appendEngine(it) }
+            }
+            viewModelScope.launch(Dispatchers.Default) {
+                service!!.rawBatteryFrames.collect { appendBattery(it) }
             }
         }
 

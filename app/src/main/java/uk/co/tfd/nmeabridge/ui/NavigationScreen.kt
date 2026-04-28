@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -41,10 +43,6 @@ import kotlin.math.roundToInt
 @Composable
 fun NavigationScreen(
     viewModel: ServerViewModel,
-    onSettings: () -> Unit,
-    onBattery: () -> Unit,
-    onEngine: () -> Unit,
-    onPolar: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
     val polar by viewModel.activePolar.collectAsState()
@@ -54,10 +52,16 @@ fun NavigationScreen(
         if (nav != null && p != null) Performance.derive(nav, p) else null
     }
 
-    Column(
+    TopLevelScreen(
+        viewModel = viewModel,
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
@@ -208,65 +212,14 @@ fun NavigationScreen(
             )
         }
 
-        // Bottom status bar
-        Spacer(Modifier.weight(1f))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // Connection indicator. Three states:
-                //   green  — GATT connected AND nav stream live
-                //   amber  — GATT connected but nav stream stale (e.g. N2K
-                //            bus off); battery/engine may still be live
-                //   grey   — server stopped
-                val navLive = nav != null
-                val linkUp = state.bluetoothConnected ||
-                    state.sourceType == uk.co.tfd.nmeabridge.service.SourceType.SIMULATOR
-                Box(
-                    modifier = Modifier
-                        .size(10.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (state.isRunning && linkUp && navLive)
-                                Color(0xFF4CAF50)
-                            else if (state.isRunning)
-                                Color(0xFFFFA000)
-                            else
-                                Color(0xFF757575)
-                        )
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = formatVariation(nav?.variation),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.width(16.dp))
-                if (state.isRunning) {
-                    Text(
-                        text = "TCP: ${state.connectedClients}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-            Row {
-                TextButton(onClick = onPolar) {
-                    Text("Polar")
-                }
-                TextButton(onClick = onEngine) {
-                    Text("Engine")
-                }
-                TextButton(onClick = onBattery) {
-                    Text("Battery")
-                }
-                TextButton(onClick = onSettings) {
-                    Text("Settings")
-                }
-            }
-        }
+        // Variation readout — the dot / TCP count / screen icons live on
+        // the shared AppBottomBar rendered by TopLevelScreen below.
+        Text(
+            text = formatVariation(nav?.variation),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
     }
 }
 

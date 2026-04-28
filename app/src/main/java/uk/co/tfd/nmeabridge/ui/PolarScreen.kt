@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FileDownload
@@ -77,7 +79,6 @@ import kotlin.math.sin
 @Composable
 fun PolarScreen(
     viewModel: ServerViewModel,
-    onBack: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -89,7 +90,9 @@ fun PolarScreen(
     var working by remember { mutableStateOf<PolarTable?>(null) }
     var dirty by remember { mutableStateOf(false) }
     var selectedTwsIdx by remember { mutableStateOf(-1) }
-    var liveMode by remember { mutableStateOf(false) }
+    // Default to live mode: the screen is most useful for observing current
+    // boat performance against the polar; editing is an occasional task.
+    var liveMode by remember { mutableStateOf(true) }
     LaunchedEffect(active?.name) {
         working = active
         dirty = false
@@ -124,20 +127,26 @@ fun PolarScreen(
 
     val polar = working
 
-    Column(
+    TopLevelScreen(
+        viewModel = viewModel,
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(12.dp),
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Top row: back / name dropdown / import / export / delete
+        // Top row: name dropdown / live / import / export / delete. Back
+        // navigation lives on the shared AppBottomBar below, or scroll to
+        // reveal it if the polar chart has pushed it off-screen.
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            TextButton(onClick = onBack) { Text("◀") }
-            Spacer(Modifier.width(4.dp))
             Box {
                 OutlinedButton(onClick = { menuOpen = true }) {
                     Text(polar?.name ?: "—")
@@ -274,6 +283,7 @@ fun PolarScreen(
                 }
             }
         }
+    }
     }
 
     if (pendingImportUri != null) {

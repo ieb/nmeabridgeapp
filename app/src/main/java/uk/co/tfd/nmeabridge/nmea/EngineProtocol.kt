@@ -1,5 +1,6 @@
 package uk.co.tfd.nmeabridge.nmea
 
+import uk.co.tfd.nmeabridge.history.RingSnapshot
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -9,23 +10,22 @@ import java.nio.ByteOrder
  */
 object EngineProtocol {
 
-    private const val MAGIC: Byte = 0xDD.toByte()
-    private const val FRAME_SIZE = 27
+    internal const val MAGIC: Byte = 0xDD.toByte()
+    internal const val FRAME_SIZE = 27
 
-    // NMEA 2000 reserves the top three values of each unsigned range for
-    // non-data sentinels (0xFFFD reserved, 0xFFFE error, 0xFFFF N/A). A
-    // firmware that clips an unrepresentable source value (e.g. -1E9 from
-    // a disconnected transducer) produces 0xFFFE, not 0xFFFF — treat the
-    // whole reserved band as no-data.
-    private const val RESERVED_U16_MIN = 0xFFFD
-    private const val RESERVED_U32_MIN = 0xFFFFFFFDL
-
-    private fun u16OrNull(raw: Int): Int? =
-        if (raw >= RESERVED_U16_MIN) null else raw
-    private fun u32OrNull(raw: Int): Long? {
-        val u = raw.toLong() and 0xFFFFFFFFL
-        return if (u >= RESERVED_U32_MIN) null else u
-    }
+    // Field offsets from magic byte at 0. See doc/ble-transport.md §Engine State.
+    internal const val OFF_RPM = 1            // U16, 0.25 rpm
+    internal const val OFF_HOURS = 3          // U32, 1 s
+    internal const val OFF_COOLANT = 7        // U16, 0.01 K
+    internal const val OFF_ALTERNATOR_T = 9   // U16, 0.01 K
+    internal const val OFF_ALTERNATOR_V = 11  // U16, 0.01 V
+    internal const val OFF_OIL = 13           // U16, 0.001 bar
+    internal const val OFF_EXHAUST = 15       // U16, 0.01 K
+    internal const val OFF_ROOM = 17          // U16, 0.01 K
+    internal const val OFF_ENGINE_BATT = 19   // U16, 0.01 V
+    internal const val OFF_FUEL = 21          // U16, 0.004 %
+    internal const val OFF_STATUS1 = 23       // U16 bitmask
+    internal const val OFF_STATUS2 = 25       // U16 bitmask
 
     fun decode(data: ByteArray): EngineState? {
         if (data.size != FRAME_SIZE) return null
@@ -70,5 +70,52 @@ object EngineProtocol {
             fuelPct = u16OrNull(fuelRaw)?.let { it * 0.004 },
             alarms = alarms
         )
+    }
+
+    // --- Per-field accessors over a history RingSnapshot -----------------
+    //
+    // Charts read one field per sample per metric. Accessors decode only
+    // the bytes they need. Parity with decode(frame).<field> guaranteed
+    // by AccessorParityTest.
+
+    fun rpmAt(s: RingSnapshot, i: Int): Int? =
+        u16OrNull(s.readU16(i, OFF_RPM))?.let { (it * 0.25).toInt() }
+
+    fun engineHoursSecAt(s: RingSnapshot, i: Int): Long? =
+        u32OrNull(s.readU32(i, OFF_HOURS))
+
+    fun coolantCAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_COOLANT))?.let { it * 0.01 - 273.15 }
+
+    fun alternatorCAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_ALTERNATOR_T))?.let { it * 0.01 - 273.15 }
+
+    fun alternatorVAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_ALTERNATOR_V))?.let { it * 0.01 }
+
+    fun oilBarAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_OIL))?.let { it * 0.001 }
+
+    fun exhaustCAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_EXHAUST))?.let { it * 0.01 - 273.15 }
+
+    fun engineRoomCAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_ROOM))?.let { it * 0.01 - 273.15 }
+
+    fun engineBattVAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_ENGINE_BATT))?.let { it * 0.01 }
+
+    fun fuelPctAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_FUEL))?.let { it * 0.004 }
+
+    /**
+     * 27 B sentinel frame used by the gap-filler ticker when no engine
+     * frame arrived in the current second. Every data field holds its
+     * "not available" sentinel so accessors return null and charts draw
+     * a gap.
+     */
+    internal val SENTINEL_FRAME: ByteArray = ByteArray(FRAME_SIZE).apply {
+        this[0] = MAGIC
+        for (i in 1 until size) this[i] = 0xFF.toByte()
     }
 }

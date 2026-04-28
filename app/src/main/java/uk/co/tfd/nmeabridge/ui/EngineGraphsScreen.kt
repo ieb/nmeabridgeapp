@@ -33,6 +33,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import uk.co.tfd.nmeabridge.nmea.EngineProtocol
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -61,7 +62,7 @@ fun EngineGraphsScreen(
     var plotLeftPx by remember { mutableFloatStateOf(0f) }
     var plotWidthPx by remember { mutableFloatStateOf(1f) }
 
-    val latest = history.lastOrNull()?.tMs ?: System.currentTimeMillis()
+    val latest = if (history.size > 0) history.newestMs else System.currentTimeMillis()
     val tEnd = endMs ?: latest
     val tStart = tEnd - windowMs
 
@@ -78,9 +79,13 @@ fun EngineGraphsScreen(
             .padding(horizontal = 10.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        EngineGraphsTopBar(onBack = onBack)
+        SubScreenTopBar(title = "ENGINE GRAPHS", onBack = onBack)
 
-        if (!state.bluetoothConnected || state.engineState == null) {
+        // Only bail out when we have neither a live engine stream nor any
+        // historical data to plot. Once history has samples we can render
+        // the chart with a gap up to "now", even if the live stream has
+        // since gone silent (e.g. NMEA 2000 bus switched off).
+        if (history.size == 0 && state.engineState == null) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -106,7 +111,7 @@ fun EngineGraphsScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .pointerInput(history.size) {
+                .pointerInput(history.version) {
                     detectTransformGestures { _, pan, zoom, _ ->
                         if (zoom != 1f) {
                             windowMs = (windowMs / zoom)
@@ -117,7 +122,7 @@ fun EngineGraphsScreen(
                             val w = plotWidthPx.coerceAtLeast(1f)
                             val msPerPx = windowMs.toDouble() / w
                             val dtMs = (-pan.x * msPerPx).toLong()
-                            val freshLatest = history.lastOrNull()?.tMs ?: System.currentTimeMillis()
+                            val freshLatest = if (history.size > 0) history.newestMs else System.currentTimeMillis()
                             val current = endMs ?: freshLatest
                             val next = current + dtMs
                             endMs = if (next >= freshLatest) null else next
@@ -165,7 +170,7 @@ fun EngineGraphsScreen(
             EngineMetricChart(
                 label = "RPM",
                 history = history,
-                extract = { it.rpm?.toDouble() },
+                extract = { s, i -> EngineProtocol.rpmAt(s, i)?.toDouble() },
                 tStart = tStart,
                 tEnd = tEnd,
                 crosshairMs = crosshairMs,
@@ -182,7 +187,7 @@ fun EngineGraphsScreen(
             EngineMetricChart(
                 label = "COOLANT °C",
                 history = history,
-                extract = { it.coolantC },
+                extract = EngineProtocol::coolantCAt,
                 tStart = tStart,
                 tEnd = tEnd,
                 crosshairMs = crosshairMs,
@@ -198,7 +203,7 @@ fun EngineGraphsScreen(
             EngineMetricChart(
                 label = "EXHAUST °C",
                 history = history,
-                extract = { it.exhaustC },
+                extract = EngineProtocol::exhaustCAt,
                 tStart = tStart,
                 tEnd = tEnd,
                 crosshairMs = crosshairMs,
@@ -214,7 +219,7 @@ fun EngineGraphsScreen(
             EngineMetricChart(
                 label = "ALT TEMP °C",
                 history = history,
-                extract = { it.alternatorC },
+                extract = EngineProtocol::alternatorCAt,
                 tStart = tStart,
                 tEnd = tEnd,
                 crosshairMs = crosshairMs,
@@ -235,23 +240,6 @@ fun EngineGraphsScreen(
             isLive = endMs == null,
             crosshairMs = crosshairMs
         )
-    }
-}
-
-@Composable
-private fun EngineGraphsTopBar(onBack: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        TextButton(onClick = onBack) { Text("< Back") }
-        Text(
-            text = "ENGINE GRAPHS",
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.width(48.dp))
     }
 }
 

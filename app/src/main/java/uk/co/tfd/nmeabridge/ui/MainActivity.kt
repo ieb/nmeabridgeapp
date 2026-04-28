@@ -10,9 +10,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
 import uk.co.tfd.nmeabridge.service.SourceType
@@ -23,8 +22,6 @@ class MainActivity : ComponentActivity() {
     private val viewModel: ServerViewModel by viewModels()
     private val bleTestViewModel: BleTestViewModel by viewModels()
 
-    private enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS, POLAR }
-    private var currentScreen by mutableStateOf(Screen.NAV)
     private var pendingBleAction: (() -> Unit)? = null
 
     private val bluetoothPermissionLauncher = registerForActivityResult(
@@ -68,41 +65,34 @@ class MainActivity : ComponentActivity() {
         setContent {
             NmeaBridgeTheme {
                 Surface {
+                    // Top-level screens read viewModel.currentScreen and
+                    // render their own AppBottomBar. Sub-screens (EngineGraphs,
+                    // BleTest) render a SubScreenTopBar instead and get here
+                    // via the parent screen's on-… callback. Navigation to
+                    // any top-level screen is always possible via the bottom
+                    // bar regardless of where you are.
+                    val currentScreen by viewModel.currentScreen.collectAsState()
                     when (currentScreen) {
-                        Screen.NAV -> NavigationScreen(
-                            viewModel = viewModel,
-                            onSettings = { currentScreen = Screen.SETTINGS },
-                            onBattery = { currentScreen = Screen.BATTERY },
-                            onEngine = { currentScreen = Screen.ENGINE },
-                            onPolar = { currentScreen = Screen.POLAR }
-                        )
-                        Screen.POLAR -> PolarScreen(
-                            viewModel = viewModel,
-                            onBack = { currentScreen = Screen.NAV }
-                        )
-                        Screen.BATTERY -> BatteryScreen(
-                            viewModel = viewModel,
-                            onBack = { currentScreen = Screen.NAV }
-                        )
+                        Screen.NAV -> NavigationScreen(viewModel = viewModel)
+                        Screen.POLAR -> PolarScreen(viewModel = viewModel)
+                        Screen.BATTERY -> BatteryScreen(viewModel = viewModel)
                         Screen.ENGINE -> EngineScreen(
                             viewModel = viewModel,
-                            onBack = { currentScreen = Screen.NAV },
-                            onGraphs = { currentScreen = Screen.ENGINE_GRAPHS }
+                            onGraphs = { viewModel.setCurrentScreen(Screen.ENGINE_GRAPHS) }
                         )
                         Screen.ENGINE_GRAPHS -> EngineGraphsScreen(
                             viewModel = viewModel,
-                            onBack = { currentScreen = Screen.ENGINE }
+                            onBack = { viewModel.setCurrentScreen(Screen.ENGINE) }
                         )
                         Screen.SETTINGS -> ServerScreen(
                             viewModel = viewModel,
                             bluetoothAvailable = bluetoothAvailable,
                             onStart = { requestPermissionsAndStart() },
                             onStop = { viewModel.stopServer(this) },
-                            onBleTest = { currentScreen = Screen.BLE_TEST },
+                            onBleTest = { viewModel.setCurrentScreen(Screen.BLE_TEST) },
                             onBleScan = {
                                 requestBlePermissionsThen { viewModel.scanForBleNmeaDevices(this) }
                             },
-                            onBack = { currentScreen = Screen.NAV }
                         )
                         Screen.BLE_TEST -> BleTestScreen(
                             viewModel = bleTestViewModel,
@@ -114,7 +104,7 @@ class MainActivity : ComponentActivity() {
                             },
                             onDisconnect = { bleTestViewModel.disconnect() },
                             onClear = { bleTestViewModel.clearLog() },
-                            onBack = { currentScreen = Screen.SETTINGS }
+                            onBack = { viewModel.setCurrentScreen(Screen.SETTINGS) }
                         )
                     }
                 }
@@ -189,7 +179,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         viewModel.startServer(this)
-        currentScreen = Screen.NAV
+        viewModel.setCurrentScreen(Screen.NAV)
     }
 
     private fun hasBluetoothPermissions(): Boolean {

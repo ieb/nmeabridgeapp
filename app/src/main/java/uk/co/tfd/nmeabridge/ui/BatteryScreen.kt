@@ -47,7 +47,6 @@ private val AlarmColor = Color(0xFFE53935)      // red
 @Composable
 fun BatteryScreen(
     viewModel: ServerViewModel,
-    onBack: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
     val history by viewModel.batteryHistory.collectAsState()
@@ -55,28 +54,26 @@ fun BatteryScreen(
     val screenHeightDp = LocalConfiguration.current.screenHeightDp.dp
     val chartHeight = screenHeightDp * 0.33f
 
-    Column(
+    TopLevelScreen(
+        viewModel = viewModel,
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
             .padding(12.dp)
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // Top bar
-        Row(
+        // Screen title — navigation lives on the shared AppBottomBar below.
+        Text(
+            text = "BATTERY",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            TextButton(onClick = onBack) { Text("< Back") }
-            Text(
-                text = "BATTERY",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.width(48.dp)) // balance row
-        }
+        )
 
         // Top third: V/I time-series chart (uses in-memory history from the VM)
         BatteryChart(
@@ -94,9 +91,12 @@ fun BatteryScreen(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = if (!state.isRunning) "Server stopped"
-                           else if (!state.bluetoothConnected) "Waiting for BLE connection…"
-                           else "Subscribing to battery…",
+                    text = when {
+                        !state.isRunning -> "Server stopped"
+                        !state.bluetoothConnected -> "Waiting for BLE connection…"
+                        history.size > 0 -> "Stream paused"
+                        else -> "Subscribing to battery…"
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -104,6 +104,7 @@ fun BatteryScreen(
         }
 
         BatteryContent(battery)
+    }
     }
 }
 

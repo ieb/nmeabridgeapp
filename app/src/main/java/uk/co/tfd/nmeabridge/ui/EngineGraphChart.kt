@@ -24,6 +24,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import uk.co.tfd.nmeabridge.history.RingSnapshot
 import kotlin.math.max
 import kotlin.math.min
 
@@ -47,8 +48,8 @@ private val CrosshairColor = Color(0xCCFFFFFF)
 @Composable
 fun EngineMetricChart(
     label: String,
-    history: List<EngineSample>,
-    extract: (EngineSample) -> Double?,
+    history: RingSnapshot,
+    extract: (RingSnapshot, Int) -> Double?,
     tStart: Long,
     tEnd: Long,
     crosshairMs: Long?,
@@ -63,26 +64,37 @@ fun EngineMetricChart(
     val density = LocalDensity.current
 
     // Slice visible samples (plus one on each side for line continuity).
-    val visible = if (history.isEmpty()) emptyList()
-    else {
-        val lo = history.indexOfFirst { it.tMs >= tStart }
-        val hi = history.indexOfLast { it.tMs <= tEnd }
-        val startIdx = if (lo == -1) history.size else max(0, lo - 1)
-        val endIdx = if (hi == -1) -1 else min(history.size - 1, hi + 1)
-        if (endIdx < startIdx) emptyList() else history.subList(startIdx, endIdx + 1)
+    val visibleStart: Int
+    val visibleEnd: Int   // inclusive
+    if (history.size == 0) {
+        visibleStart = 0; visibleEnd = -1
+    } else {
+        val lo = history.lowerBound(tStart)
+        val hiExclusive = history.upperBound(tEnd)
+        visibleStart = max(0, lo - 1)
+        visibleEnd = min(history.size - 1, hiExclusive)
     }
+    val visibleCount = if (visibleEnd < visibleStart) 0 else visibleEnd - visibleStart + 1
 
     // Display value: crosshair value when pinned, otherwise latest.
     val displayedValue: Double? = when {
-        crosshairMs != null && history.isNotEmpty() -> {
-            val nearest = history.minByOrNull { kotlin.math.abs(it.tMs - crosshairMs) }
-            nearest?.let(extract)
+        crosshairMs != null && history.size > 0 -> {
+            val idx = nearestIndex(history, crosshairMs)
+            if (idx >= 0) extract(history, idx) else null
         }
-        else -> history.lastOrNull()?.let(extract)
+        history.size > 0 -> extract(history, history.size - 1)
+        else -> null
     }
 
+    // Precompute Y values over the visible slice once (skip nulls for range calc).
+    val sliceValues = DoubleArray(visibleCount) { k ->
+        extract(history, visibleStart + k) ?: Double.NaN
+    }
+    val finiteValues = ArrayList<Double>(visibleCount)
+    for (v in sliceValues) if (!v.isNaN()) finiteValues += v
+
     val (yMin, yMax) = niceRange(
-        values = visible.mapNotNull(extract),
+        values = finiteValues,
         fallbackLo = fallbackLo,
         fallbackHi = fallbackHi,
         minSpan = minSpan,
@@ -152,7 +164,7 @@ fun EngineMetricChart(
             )
 
             // Series path — break on null samples to show gaps.
-            if (visible.isNotEmpty()) {
+            if (visibleCount > 0) {
                 val span = (tEnd - tStart).coerceAtLeast(1L)
                 val ySpan = (yMax - yMin).coerceAtLeast(1e-9)
 
@@ -164,13 +176,14 @@ fun EngineMetricChart(
 
                 val path = Path()
                 var penDown = false
-                for (s in visible) {
-                    val v = extract(s)
-                    if (v == null) {
+                for (k in 0 until visibleCount) {
+                    val v = sliceValues[k]
+                    if (v.isNaN()) {
                         penDown = false
                         continue
                     }
-                    val x = xOf(s.tMs).coerceIn(plotLeft, plotRight)
+                    val t = history.timestampAt(visibleStart + k)
+                    val x = xOf(t).coerceIn(plotLeft, plotRight)
                     val y = yOf(v).coerceIn(plotTop, plotBottom)
                     if (!penDown) {
                         path.moveTo(x, y)
@@ -190,8 +203,8 @@ fun EngineMetricChart(
                         Offset(cx, plotBottom),
                         strokeWidth = 1f
                     )
-                    val nearest = history.minByOrNull { kotlin.math.abs(it.tMs - crosshairMs) }
-                    val markerV = nearest?.let(extract)
+                    val idx = nearestIndex(history, crosshairMs)
+                    val markerV = if (idx >= 0) extract(history, idx) else null
                     if (markerV != null) {
                         val my = yOf(markerV).coerceIn(plotTop, plotBottom)
                         drawCircle(color, radius = 3.5f, center = Offset(cx, my))
@@ -200,6 +213,17 @@ fun EngineMetricChart(
             }
         }
     }
+}
+
+// Binary-search for the logical index whose timestamp is closest to tMs.
+// Returns -1 when the snapshot is empty.
+private fun nearestIndex(s: RingSnapshot, tMs: Long): Int {
+    if (s.size == 0) return -1
+    val lo = s.lowerBound(tMs).coerceIn(0, s.size - 1)
+    if (lo == 0) return 0
+    val tLo = s.timestampAt(lo)
+    val tPrev = s.timestampAt(lo - 1)
+    return if (kotlin.math.abs(tLo - tMs) <= kotlin.math.abs(tPrev - tMs)) lo else lo - 1
 }
 
 private fun toAndroidColor(c: Color): Int {

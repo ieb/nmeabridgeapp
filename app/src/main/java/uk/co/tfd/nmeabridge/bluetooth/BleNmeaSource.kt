@@ -20,9 +20,12 @@ import uk.co.tfd.nmeabridge.nmea.EngineProtocol
 import uk.co.tfd.nmeabridge.nmea.EngineState
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 import uk.co.tfd.nmeabridge.nmea.NmeaSource
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 
@@ -53,16 +56,15 @@ class BleNmeaSource(
 
         private const val RECONNECT_DELAY_MS = 3000L
 
-        // Nav frames are published at 1 Hz. If none arrive for this long,
-        // treat the stream as stale: drop last-known NavigationState so
-        // downstream consumers render "not available" instead of frozen
-        // numbers, and flip the UI connection indicator to the
-        // "disconnected" colour so the stale condition is visible.
-        // Do NOT tear down GATT on nav silence — the NMEA 2000 bus can be
-        // off while BMS/engine data continue to flow over BLE, and a
-        // disconnect would lose their history. Reconnect is driven only by
-        // real link-layer STATE_DISCONNECTED events.
+        // Nav / engine frames are published at 1 Hz. If none arrive for
+        // this long, treat that stream as stale: drop last-known decoded
+        // state so dials and the nav dot stop showing frozen numbers. The
+        // BLE / GATT link stays up either way — BMS (on its own power rail)
+        // can continue to flow even when the N2K bus is off.
         private const val NAV_STALENESS_MS = 5_000L
+        private const val ENGINE_STALENESS_MS = 5_000L
+        // BMS cadence is slower (~5 s); allow more silence before clearing.
+        private const val BATTERY_STALENESS_MS = 15_000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -78,6 +80,26 @@ class BleNmeaSource(
 
     private val _engineState = MutableStateFlow<EngineState?>(null)
     val engineState: StateFlow<EngineState?> = _engineState.asStateFlow()
+
+    // Raw wire-frame streams for history capture. Published alongside the
+    // decoded StateFlows above so downstream rings can store full fidelity
+    // bytes (same format as the BLE transport) without re-encoding. Extra
+    // buffer + DROP_OLDEST absorbs any transient slow consumer without
+    // blocking the GATT callback thread.
+    private val _rawNavFrames = MutableSharedFlow<ByteArray>(
+        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawNavFrames: SharedFlow<ByteArray> = _rawNavFrames.asSharedFlow()
+
+    private val _rawEngineFrames = MutableSharedFlow<ByteArray>(
+        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawEngineFrames: SharedFlow<ByteArray> = _rawEngineFrames.asSharedFlow()
+
+    private val _rawBatteryFrames = MutableSharedFlow<ByteArray>(
+        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawBatteryFrames: SharedFlow<ByteArray> = _rawBatteryFrames.asSharedFlow()
 
     private var commandChar: BluetoothGattCharacteristic? = null
     private var batteryChar: BluetoothGattCharacteristic? = null
@@ -112,6 +134,18 @@ class BleNmeaSource(
         _navigationState.value = null
     }
 
+    private val engineStaleRunnable = Runnable {
+        // Engine stream silent — unfreezes the dials so they show "—"
+        // instead of the last-known values. Does not disconnect GATT.
+        _engineState.value = null
+    }
+
+    private val batteryStaleRunnable = Runnable {
+        // BMS stream silent — battery screen shows "—". Independent of
+        // nav/engine state: BMS can keep flowing when the N2K bus is off.
+        _batteryState.value = null
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -133,11 +167,16 @@ class BleNmeaSource(
                     commandChar = null
                     pendingGattOps.clear()
                     gattOpInFlight = false
-                    // Disconnect implies nav data is no longer valid. Drop it
-                    // now rather than waiting for the staleness watchdog, so
-                    // the UI and TCP output reflect the lost link immediately.
+                    // Disconnect implies nav/engine/battery data is no longer
+                    // valid. Drop it now rather than waiting for staleness
+                    // watchdogs so the UI and TCP output reflect the lost
+                    // link immediately.
                     handler.removeCallbacks(navStaleRunnable)
+                    handler.removeCallbacks(engineStaleRunnable)
+                    handler.removeCallbacks(batteryStaleRunnable)
                     _navigationState.value = null
+                    _engineState.value = null
+                    _batteryState.value = null
                     if (running) {
                         onConnectionStateChanged(false, "Reconnecting in 3s...")
                         handler.postDelayed({ doConnect() }, RECONNECT_DELAY_MS)
@@ -292,12 +331,22 @@ class BleNmeaSource(
         }
         if (charUuid == BW_BATTERY_UUID) {
             val parsed = BmsProtocol.decode(value)
-            if (parsed != null) _batteryState.value = parsed
+            if (parsed != null) {
+                _batteryState.value = parsed
+                _rawBatteryFrames.tryEmit(value)
+                handler.removeCallbacks(batteryStaleRunnable)
+                handler.postDelayed(batteryStaleRunnable, BATTERY_STALENESS_MS)
+            }
             return
         }
         if (charUuid == ENGINE_STATE_UUID) {
             val parsed = EngineProtocol.decode(value)
-            if (parsed != null) _engineState.value = parsed
+            if (parsed != null) {
+                _engineState.value = parsed
+                _rawEngineFrames.tryEmit(value)
+                handler.removeCallbacks(engineStaleRunnable)
+                handler.postDelayed(engineStaleRunnable, ENGINE_STALENESS_MS)
+            }
             return
         }
         processIncomingBytes(value)
@@ -502,6 +551,8 @@ class BleNmeaSource(
 
         // Publish navigation state for the UI
         _navigationState.value = nav
+        // Raw frame for history rings. Same bytes as on the wire, 29 B.
+        _rawNavFrames.tryEmit(data)
 
         // Reset the staleness watchdog: another nav frame within
         // NAV_STALENESS_MS keeps the state live; silence triggers

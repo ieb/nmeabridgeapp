@@ -1,5 +1,6 @@
 package uk.co.tfd.nmeabridge.nmea
 
+import uk.co.tfd.nmeabridge.history.RingSnapshot
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -14,35 +15,25 @@ import kotlin.math.abs
  */
 object BinaryProtocol {
 
-    private const val MAGIC: Byte = 0xCC.toByte()
-    private const val FRAME_SIZE = 29
+    internal const val MAGIC: Byte = 0xCC.toByte()
+    internal const val FRAME_SIZE = 29
 
-    // NMEA 2000 reserves the top of each range for non-data sentinels:
-    //   0xFFFF / 0x7FFF  — not available
-    //   0xFFFE / 0x7FFE  — out of range / error
-    //   0xFFFD / 0x7FFD  — reserved
-    // Firmware that clips an unrepresentable source value (e.g. -1E9 from a
-    // disconnected N2K depth transducer) produces 0xFFFE. Treat anything in
-    // the reserved band as no-data so the UI shows "—" instead of 655.3 m.
-    private const val RESERVED_U16_MIN = 0xFFFD
-    private const val RESERVED_U32_MIN = 0xFFFFFFFDL
-    private const val RESERVED_S16_MIN = 0x7FFD
-    private const val RESERVED_S32_MIN = 0x7FFFFFFD
+    // Field offsets from magic byte at 0. See doc/ble-transport.md §Navigation State.
+    internal const val OFF_LAT = 1       // S32, 1e-7 deg
+    internal const val OFF_LON = 5       // S32, 1e-7 deg
+    internal const val OFF_COG = 9       // U16, 0.0001 rad
+    internal const val OFF_SOG = 11      // U16, 0.01 m/s
+    internal const val OFF_VARIATION = 13 // S16, 0.0001 rad
+    internal const val OFF_HEADING = 15  // U16, 0.0001 rad
+    internal const val OFF_DEPTH = 17    // U16, 0.01 m
+    internal const val OFF_AWA = 19      // U16, 0.0001 rad
+    internal const val OFF_AWS = 21      // U16, 0.01 m/s
+    internal const val OFF_STW = 23      // U16, 0.01 m/s
+    internal const val OFF_LOG = 25      // U32, 1 m
 
-    private fun u16OrNull(raw: Int): Int? =
-        if (raw >= RESERVED_U16_MIN) null else raw
-    private fun u32OrNull(raw: Int): Long? {
-        val u = raw.toLong() and 0xFFFFFFFFL
-        return if (u >= RESERVED_U32_MIN) null else u
-    }
-    private fun s16OrNull(raw: Short): Int? =
-        if (raw.toInt() >= RESERVED_S16_MIN) null else raw.toInt()
-    private fun s32OrNull(raw: Int): Int? =
-        if (raw >= RESERVED_S32_MIN) null else raw
-
-    private const val MS_TO_KNOTS = 1.0 / 0.514444
-    private const val M_TO_NM = 1.0 / 1852.0
-    private const val RAD_TO_DEG = 180.0 / Math.PI
+    internal const val MS_TO_KNOTS = 1.0 / 0.514444
+    internal const val M_TO_NM = 1.0 / 1852.0
+    internal const val RAD_TO_DEG = 180.0 / Math.PI
 
     private val utcTimeFormat = SimpleDateFormat("HHmmss.00", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -189,5 +180,73 @@ object BinaryProtocol {
         val d = absDeg.toInt()
         val m = (absDeg - d) * 60.0
         return Pair("%03d%07.4f".format(d, m), if (degrees >= 0) "E" else "W")
+    }
+
+    // --- Per-field accessors over a history RingSnapshot -----------------
+    //
+    // Each reads the 2-4 bytes it needs, applies the reserved-band sentinel
+    // check (Sentinels.kt), and scales into the public unit. Unit-testable
+    // in isolation and guaranteed equivalent to decode(frame).<field> by
+    // AccessorParityTest.
+
+    fun latAt(s: RingSnapshot, i: Int): Double? =
+        s32OrNull(s.readS32(i, OFF_LAT))?.let { it / 1e7 }
+
+    fun lonAt(s: RingSnapshot, i: Int): Double? =
+        s32OrNull(s.readS32(i, OFF_LON))?.let { it / 1e7 }
+
+    fun cogAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_COG))?.let { it * 0.0001 * RAD_TO_DEG }
+
+    fun sogAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_SOG))?.let { it * 0.01 * MS_TO_KNOTS }
+
+    fun variationAt(s: RingSnapshot, i: Int): Double? =
+        s16OrNull(s.readS16(i, OFF_VARIATION))?.let { it * 0.0001 * RAD_TO_DEG }
+
+    fun headingAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_HEADING))?.let { it * 0.0001 * RAD_TO_DEG }
+
+    fun depthAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_DEPTH))?.let { it * 0.01 }
+
+    fun awaAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_AWA))?.let {
+            val deg = it * 0.0001 * RAD_TO_DEG
+            if (deg > 180.0) deg - 360.0 else deg
+        }
+
+    fun awsAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_AWS))?.let { it * 0.01 * MS_TO_KNOTS }
+
+    fun stwAt(s: RingSnapshot, i: Int): Double? =
+        u16OrNull(s.readU16(i, OFF_STW))?.let { it * 0.01 * MS_TO_KNOTS }
+
+    fun logNmAt(s: RingSnapshot, i: Int): Double? =
+        u32OrNull(s.readU32(i, OFF_LOG))?.let { it * M_TO_NM }
+
+    /**
+     * 29 B sentinel frame used by the gap-filler ticker when no nav frame
+     * arrived in the current second. Each field encoded with its specific
+     * "not available" value: 0x7FFFFFFF for S32 (lat/lon), 0x7FFF for S16
+     * (variation), 0xFFFF for U16, 0xFFFFFFFF for U32 (log). A blanket
+     * 0xFF fill would leave signed fields holding -1 (valid data).
+     */
+    internal val SENTINEL_FRAME: ByteArray = run {
+        val buf = java.nio.ByteBuffer.allocate(FRAME_SIZE)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        buf.put(MAGIC)
+        buf.putInt(0x7FFFFFFF)              // lat s32 N/A
+        buf.putInt(0x7FFFFFFF)              // lon s32 N/A
+        buf.putShort(0xFFFF.toShort())      // cog u16 N/A
+        buf.putShort(0xFFFF.toShort())      // sog u16 N/A
+        buf.putShort(0x7FFF)                // variation s16 N/A
+        buf.putShort(0xFFFF.toShort())      // heading u16 N/A
+        buf.putShort(0xFFFF.toShort())      // depth u16 N/A
+        buf.putShort(0xFFFF.toShort())      // awa u16 N/A
+        buf.putShort(0xFFFF.toShort())      // aws u16 N/A
+        buf.putShort(0xFFFF.toShort())      // stw u16 N/A
+        buf.putInt(-1)                      // log u32 N/A (0xFFFFFFFF)
+        buf.array()
     }
 }

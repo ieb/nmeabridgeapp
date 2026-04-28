@@ -62,7 +62,6 @@ fun ServerScreen(
     onStop: () -> Unit,
     onBleTest: () -> Unit = {},
     onBleScan: () -> Unit = {},
-    onBack: () -> Unit = {}
 ) {
     val serviceState by viewModel.serviceState.collectAsState()
     val debugState by viewModel.debugState.collectAsState()
@@ -71,19 +70,19 @@ fun ServerScreen(
     val selectedDevice by viewModel.selectedDevice.collectAsState()
     val pairedDevices by viewModel.pairedDevices.collectAsState()
 
+    TopLevelScreen(
+        viewModel = viewModel,
+        modifier = Modifier.fillMaxSize(),
+    ) {
     Column(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxWidth()
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Header
+        // Header — navigation lives on the shared AppBottomBar below.
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) {
-                Text("Back")
-            }
-            Spacer(Modifier.width(12.dp))
             Text(
                 text = "Settings",
                 style = MaterialTheme.typography.headlineMedium
@@ -314,6 +313,7 @@ fun ServerScreen(
         ) {
             Text("BLE Diagnostic Test")
         }
+    }
     }
 }
 

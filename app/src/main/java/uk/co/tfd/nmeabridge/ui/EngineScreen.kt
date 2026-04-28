@@ -34,7 +34,6 @@ import uk.co.tfd.nmeabridge.nmea.EngineState
 @Composable
 fun EngineScreen(
     viewModel: ServerViewModel,
-    onBack: () -> Unit,
     onGraphs: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
@@ -44,13 +43,14 @@ fun EngineScreen(
     // real alarms) communicate the current status.
     val engine = state.engineState ?: EngineState()
 
-    // BoxWithConstraints forces a bounded-height layout context so the
-    // weights on the dials below actually resolve (weights silently collapse
-    // to 0 inside a parent with unbounded height).
-    BoxWithConstraints(
+    // TopLevelScreen gives the content `weight(1f)` inside a Column
+    // bounded by the window height, which is what the dial row weights
+    // need to resolve. The shared AppBottomBar is pinned below.
+    TopLevelScreen(
+        viewModel = viewModel,
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
+            .background(MaterialTheme.colorScheme.background),
     ) {
         val padding = 8.dp
         val spacing = 6.dp
@@ -61,7 +61,12 @@ fun EngineScreen(
                 .padding(padding),
             verticalArrangement = Arrangement.spacedBy(spacing)
         ) {
-            EngineTopBar(onBack = onBack)
+            Text(
+                text = "ENGINE",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth(),
+            )
 
             // Active alarms are rendered INSIDE the tachometer dial (below the
             // hour meter) so they're always visible, regardless of how the
@@ -122,23 +127,6 @@ fun EngineScreen(
 
             SecondaryValues(engine)
         }
-    }
-}
-
-@Composable
-private fun EngineTopBar(onBack: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        TextButton(onClick = onBack) { Text("< Back") }
-        Text(
-            text = "ENGINE",
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.width(48.dp))
     }
 }
 

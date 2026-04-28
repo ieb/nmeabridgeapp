@@ -29,6 +29,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import uk.co.tfd.nmeabridge.history.RingSnapshot
+import uk.co.tfd.nmeabridge.nmea.BmsProtocol
 import kotlin.math.max
 import kotlin.math.min
 
@@ -43,7 +45,7 @@ private const val DEFAULT_WINDOW_MS = 5L * 60 * 1000    // 5 min
 
 @Composable
 fun BatteryChart(
-    history: List<BatterySample>,
+    history: RingSnapshot,
     modifier: Modifier = Modifier
 ) {
     // null endMs = follow live (pin to latest sample)
@@ -66,7 +68,7 @@ fun BatteryChart(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(4.dp)
-                .pointerInput(history.size) {
+                .pointerInput(history.version) {
                     detectTransformGestures { _, pan, zoom, _ ->
                         // Zoom
                         if (zoom != 1f) {
@@ -79,7 +81,7 @@ fun BatteryChart(
                             val plotW = (canvasWidthPx - leftPadPx - rightPadPx).coerceAtLeast(1f)
                             val msPerPx = windowMs.toDouble() / plotW
                             val dtMs = (-pan.x * msPerPx).toLong()
-                            val latest = history.lastOrNull()?.tMs ?: System.currentTimeMillis()
+                            val latest = if (history.size > 0) history.newestMs else System.currentTimeMillis()
                             val current = endMs ?: latest
                             val next = current + dtMs
                             // Clamp: don't pan beyond latest (snap to live when reached)
@@ -104,28 +106,47 @@ fun BatteryChart(
             val plotH = (plotBottom - plotTop).coerceAtLeast(1f)
 
             // Resolve time window
-            val latest = history.lastOrNull()?.tMs ?: System.currentTimeMillis()
+            val latest = if (history.size > 0) history.newestMs else System.currentTimeMillis()
             val tEnd = endMs ?: latest
             val tStart = tEnd - windowMs
 
-            // Slice visible data (plus one point before / after so lines reach the edges)
-            val visible = if (history.isEmpty()) emptyList()
-            else {
-                val lo = history.indexOfFirst { it.tMs >= tStart }
-                val hi = history.indexOfLast { it.tMs <= tEnd }
-                val startIdx = if (lo == -1) history.size else max(0, lo - 1)
-                val endIdx = if (hi == -1) -1 else min(history.size - 1, hi + 1)
-                if (endIdx < startIdx) emptyList() else history.subList(startIdx, endIdx + 1)
+            // Slice visible data (plus one point before / after so lines
+            // reach the edges). Snapshot bounds are inclusive [startIdx, endIdx].
+            val startIdx: Int
+            val endIdx: Int
+            if (history.size == 0) {
+                startIdx = 0; endIdx = -1
+            } else {
+                val lo = history.lowerBound(tStart)
+                val hiExclusive = history.upperBound(tEnd)
+                startIdx = max(0, lo - 1)                      // one point before
+                endIdx = min(history.size - 1, hiExclusive)   // one point after (upperBound already +1)
             }
+            val visibleCount = if (endIdx < startIdx) 0 else endIdx - startIdx + 1
 
-            // Compute axis ranges from visible points, with sensible fallbacks / padding
+            // Compute axis ranges by walking the slice once, extracting v and
+            // i via per-field accessors. Gap-filler sentinels surface as
+            // nulls here — NaN lets us keep the arrays fixed-size while
+            // still skipping nulls in niceRange and the draw loop.
+            val iValues = DoubleArray(visibleCount) { k ->
+                BmsProtocol.currentAAt(history, startIdx + k) ?: Double.NaN
+            }
+            val vValues = DoubleArray(visibleCount) { k ->
+                BmsProtocol.packVAt(history, startIdx + k) ?: Double.NaN
+            }
+            val iFinite = ArrayList<Double>(visibleCount)
+            val vFinite = ArrayList<Double>(visibleCount)
+            for (k in 0 until visibleCount) {
+                if (!iValues[k].isNaN()) iFinite += iValues[k]
+                if (!vValues[k].isNaN()) vFinite += vValues[k]
+            }
             val (iMin, iMax) = niceRange(
-                visible.map { it.i.toDouble() },
+                iFinite,
                 fallbackLo = -10.0, fallbackHi = 10.0,
                 minSpan = 2.0, includeZero = true
             )
             val (vMin, vMax) = niceRange(
-                visible.map { it.v.toDouble() },
+                vFinite,
                 fallbackLo = 12.0, fallbackHi = 14.4,
                 minSpan = 0.2, includeZero = false
             )
@@ -187,10 +208,10 @@ fun BatteryChart(
                 )
             }
 
-            if (visible.size < 2) {
+            if (visibleCount < 2) {
                 // Not enough data to draw a line
                 drawContext.canvas.nativeCanvas.drawText(
-                    if (history.isEmpty()) "waiting for data…" else "extend window to see history",
+                    if (history.size == 0) "waiting for data…" else "extend window to see history",
                     plotLeft + 6f,
                     plotTop + 14f,
                     labelPaint
@@ -214,16 +235,26 @@ fun BatteryChart(
 
             val currentPath = Path()
             val voltagePath = Path()
-            visible.forEachIndexed { idx, s ->
-                val x = xOf(s.tMs)
-                val yI = yOfI(s.i.toDouble())
-                val yV = yOfV(s.v.toDouble())
-                if (idx == 0) {
-                    currentPath.moveTo(x, yI)
-                    voltagePath.moveTo(x, yV)
+            var iPenDown = false
+            var vPenDown = false
+            for (k in 0 until visibleCount) {
+                val i = startIdx + k
+                val x = xOf(history.timestampAt(i))
+                val iv = iValues[k]
+                val vv = vValues[k]
+                if (iv.isNaN()) {
+                    iPenDown = false
                 } else {
-                    currentPath.lineTo(x, yI)
-                    voltagePath.lineTo(x, yV)
+                    val y = yOfI(iv)
+                    if (!iPenDown) { currentPath.moveTo(x, y); iPenDown = true }
+                    else currentPath.lineTo(x, y)
+                }
+                if (vv.isNaN()) {
+                    vPenDown = false
+                } else {
+                    val y = yOfV(vv)
+                    if (!vPenDown) { voltagePath.moveTo(x, y); vPenDown = true }
+                    else voltagePath.lineTo(x, y)
                 }
             }
 
@@ -239,11 +270,20 @@ fun BatteryChart(
             )
         }
 
-        // Overlay: current and voltage legend with latest values
-        val latestSample = history.lastOrNull()
-        if (latestSample != null) {
+        // Overlay: current and voltage legend with latest values. Walk
+        // backwards to find the most recent non-null sample — the very
+        // latest frame may be a gap-filler sentinel if the stream died.
+        if (history.size > 0) {
+            var latestI: Double? = null
+            var latestV: Double? = null
+            var k = history.size - 1
+            while (k >= 0 && (latestI == null || latestV == null)) {
+                if (latestI == null) latestI = BmsProtocol.currentAAt(history, k)
+                if (latestV == null) latestV = BmsProtocol.packVAt(history, k)
+                k--
+            }
             Text(
-                text = "I %.1f A".format(latestSample.i),
+                text = latestI?.let { "I %.1f A".format(it) } ?: "I —",
                 color = CurrentColor,
                 fontSize = 12.sp,
                 modifier = Modifier
@@ -251,7 +291,7 @@ fun BatteryChart(
                     .padding(start = 48.dp, top = 2.dp)
             )
             Text(
-                text = "V %.2f".format(latestSample.v),
+                text = latestV?.let { "V %.2f".format(it) } ?: "V —",
                 color = VoltageColor,
                 fontSize = 12.sp,
                 modifier = Modifier
@@ -262,5 +302,5 @@ fun BatteryChart(
     }
 
     // Touch the state so recomposition keeps following live when new data arrives
-    LaunchedEffect(history.size) { /* no-op, triggers recompose */ }
+    LaunchedEffect(history.version) { /* no-op, triggers recompose */ }
 }

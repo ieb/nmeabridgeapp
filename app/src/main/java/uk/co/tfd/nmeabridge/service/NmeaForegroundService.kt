@@ -23,7 +23,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -39,6 +41,26 @@ class NmeaForegroundService : Service() {
 
     private val _debug = MutableStateFlow(DebugState())
     val debug: StateFlow<DebugState> = _debug.asStateFlow()
+
+    // Raw wire frames for history rings. Always-on service-level fan-out
+    // so that when the current nmeaSource is a BleNmeaSource its raw flows
+    // are forwarded here; when it's a simulator source these stay empty.
+    // Published alongside decoded ServiceState so the VM can maintain
+    // wire-format history rings without a separate binding path.
+    private val _rawNavFrames = MutableSharedFlow<ByteArray>(
+        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawNavFrames: SharedFlow<ByteArray> = _rawNavFrames.asSharedFlow()
+
+    private val _rawEngineFrames = MutableSharedFlow<ByteArray>(
+        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawEngineFrames: SharedFlow<ByteArray> = _rawEngineFrames.asSharedFlow()
+
+    private val _rawBatteryFrames = MutableSharedFlow<ByteArray>(
+        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rawBatteryFrames: SharedFlow<ByteArray> = _rawBatteryFrames.asSharedFlow()
 
     private val nmeaFlow = MutableSharedFlow<String>(
         replay = 0,
@@ -143,6 +165,19 @@ class NmeaForegroundService : Service() {
                 source.engineState.collect { engine ->
                     _state.update { it.copy(engineState = engine) }
                 }
+            }
+            // Forward raw wire frames from the BLE source to service-level
+            // SharedFlows so the VM (or any other service consumer) can
+            // maintain wire-format history rings without binding to the
+            // source directly.
+            serviceScope.launch {
+                source.rawNavFrames.collect { _rawNavFrames.tryEmit(it) }
+            }
+            serviceScope.launch {
+                source.rawEngineFrames.collect { _rawEngineFrames.tryEmit(it) }
+            }
+            serviceScope.launch {
+                source.rawBatteryFrames.collect { _rawBatteryFrames.tryEmit(it) }
             }
         }
 
