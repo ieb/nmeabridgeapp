@@ -72,6 +72,16 @@ class NmeaForegroundService : Service() {
     private var nmeaSource: NmeaSource? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    // Append-only disk persistence. Created once per service instance;
+    // writes happen from the raw-frame collectors below (same coroutine
+    // as the fan-out to _rawXxxFrames). Closed in onDestroy.
+    private lateinit var historyLogger: uk.co.tfd.nmeabridge.history.persist.HistoryLogger
+
+    override fun onCreate() {
+        super.onCreate()
+        historyLogger = uk.co.tfd.nmeabridge.history.persist.HistoryLogger(this)
+    }
+
     inner class LocalBinder : Binder() {
         val service: NmeaForegroundService get() = this@NmeaForegroundService
     }
@@ -170,14 +180,30 @@ class NmeaForegroundService : Service() {
             // SharedFlows so the VM (or any other service consumer) can
             // maintain wire-format history rings without binding to the
             // source directly.
+            // Fan out raw frames to (a) in-memory VM history and
+            // (b) append-only disk log. The disk writer rotates files
+            // at midnight UTC and pads sentinel slots across gaps.
             serviceScope.launch {
-                source.rawNavFrames.collect { _rawNavFrames.tryEmit(it) }
+                source.rawNavFrames.collect {
+                    _rawNavFrames.tryEmit(it)
+                    historyLogger.nav.append(it)
+                }
             }
             serviceScope.launch {
-                source.rawEngineFrames.collect { _rawEngineFrames.tryEmit(it) }
+                source.rawEngineFrames.collect {
+                    _rawEngineFrames.tryEmit(it)
+                    historyLogger.engine.append(it)
+                }
             }
             serviceScope.launch {
-                source.rawBatteryFrames.collect { _rawBatteryFrames.tryEmit(it) }
+                source.rawBatteryFrames.collect {
+                    _rawBatteryFrames.tryEmit(it)
+                    // BMS is variable-length on the wire; canonicalise to
+                    // the fixed 48 B history slot before logging. Any
+                    // malformed frame (too short etc.) is dropped.
+                    val slot = uk.co.tfd.nmeabridge.nmea.BmsProtocol.encodeHistorySlot(it)
+                    if (slot != null) historyLogger.bms.append(slot)
+                }
             }
         }
 
@@ -264,6 +290,10 @@ class NmeaForegroundService : Service() {
     override fun onDestroy() {
         nmeaSource?.stop()
         tcpServer?.stop()
+        // Close history files before cancelling the scope: the close path
+        // runs fd.sync() one final time so the last record is durable
+        // even if the process is killed microseconds later.
+        if (::historyLogger.isInitialized) historyLogger.close()
         serviceScope.cancel()
         releaseWakeLock()
         _state.update { ServiceState() }
