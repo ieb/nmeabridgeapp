@@ -56,9 +56,12 @@ private const val HISTORY_PUBLISH_INTERVAL_MS = 1000L
 // holding the last value until the next real sample arrives.
 private const val HISTORY_TICK_MS = 1000L
 // If no real frame arrived within this window, the ticker inserts a
-// sentinel. Set slightly above the nominal 1 Hz cadence so ordinary jitter
-// doesn't trigger spurious gaps.
-private const val HISTORY_GAP_THRESHOLD_MS = 1_500L
+// sentinel. Nav/engine publish at ~1 Hz, but BLE notification jitter,
+// GC, and connection-interval drift routinely delay a frame by more
+// than 500 ms. 1.5 s left no headroom and produced visible holes in
+// the engine chart while data was still flowing; 3 s tolerates normal
+// jitter and still flags a dead stream within ~2 samples.
+private const val HISTORY_GAP_THRESHOLD_MS = 3_000L
 
 // BMS cadence is much slower in practice (~5 s from the BoatWatch firmware
 // and the Python simulator). Threshold has to exceed the real cadence
