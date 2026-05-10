@@ -12,6 +12,11 @@ import uk.co.tfd.nmeabridge.NmeaBridgeApp
 import uk.co.tfd.nmeabridge.bluetooth.BleNmeaSource
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothGpsSource
+import uk.co.tfd.nmeabridge.history.FrameRing
+import uk.co.tfd.nmeabridge.history.RingSnapshot
+import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
+import uk.co.tfd.nmeabridge.nmea.BmsProtocol
+import uk.co.tfd.nmeabridge.nmea.EngineProtocol
 import uk.co.tfd.nmeabridge.nmea.NmeaSource
 import uk.co.tfd.nmeabridge.server.NmeaTcpServer
 import uk.co.tfd.nmeabridge.simulator.SimulatorNmeaSource
@@ -21,16 +26,48 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.Inet4Address
 import java.net.NetworkInterface
+
+// History ring capacities: 12 h at 1 Hz = 43 200 frames. The BMS source
+// publishes at 0.2 Hz in practice, so the BMS ring holds ~60 h of data
+// at that rate — still well under 1 MB for a 48 B fixed slot.
+private const val HISTORY_CAPACITY = 43_200
+
+// Cap how often we publish a fresh RingSnapshot to subscribers. Append
+// into the ring happens on every BLE notification; only the StateFlow
+// emission (and any resulting Compose recomposition) is throttled.
+private const val HISTORY_PUBLISH_INTERVAL_MS = 1000L
+
+// Target cadence for the history rings. Every HISTORY_TICK_MS a background
+// ticker tops up each ring with a sentinel frame (all-0xFF data) if no
+// real frame has arrived within the grace window. Keeps the time axis
+// contiguous so chart lines show gaps when the stream dies instead of
+// holding the last value until the next real sample arrives.
+private const val HISTORY_TICK_MS = 1000L
+
+// If no real frame arrived within this window, the ticker inserts a
+// sentinel. Nav/engine publish at ~1 Hz, but BLE notification jitter,
+// GC, and connection-interval drift routinely delay a frame by more
+// than 500 ms. 1.5 s left no headroom and produced visible holes in
+// the engine chart while data was still flowing; 3 s tolerates normal
+// jitter and still flags a dead stream within ~2 samples.
+private const val HISTORY_GAP_THRESHOLD_MS = 3_000L
+
+// BMS cadence is much slower in practice (~5 s from the BoatWatch firmware
+// and the Python simulator). Threshold has to exceed the real cadence
+// plus jitter, otherwise the ticker inserts a sentinel between every pair
+// of real frames and the chart line breaks visibly even while data is
+// flowing.
+private const val BATTERY_GAP_THRESHOLD_MS = 15_000L
 
 class NmeaForegroundService : Service() {
 
@@ -42,25 +79,43 @@ class NmeaForegroundService : Service() {
     private val _debug = MutableStateFlow(DebugState())
     val debug: StateFlow<DebugState> = _debug.asStateFlow()
 
-    // Raw wire frames for history rings. Always-on service-level fan-out
-    // so that when the current nmeaSource is a BleNmeaSource its raw flows
-    // are forwarded here; when it's a simulator source these stay empty.
-    // Published alongside decoded ServiceState so the VM can maintain
-    // wire-format history rings without a separate binding path.
-    private val _rawNavFrames = MutableSharedFlow<ByteArray>(
-        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    // Wire-format history rings live on the service (rather than the
+    // ViewModel) so they share lifetime with the BLE pipeline. Activity
+    // recreation no longer wipes the in-memory chart history: the new VM
+    // mirrors these StateFlows and gets the latest snapshot on subscribe.
+    private val navRing = FrameRing(
+        frameSize = BinaryProtocol.FRAME_SIZE,
+        capacity = HISTORY_CAPACITY,
     )
-    val rawNavFrames: SharedFlow<ByteArray> = _rawNavFrames.asSharedFlow()
+    private val engineRing = FrameRing(
+        frameSize = EngineProtocol.FRAME_SIZE,
+        capacity = HISTORY_CAPACITY,
+    )
+    private val batteryRing = FrameRing(
+        frameSize = BmsProtocol.HISTORY_SLOT_SIZE,
+        capacity = HISTORY_CAPACITY,
+    )
 
-    private val _rawEngineFrames = MutableSharedFlow<ByteArray>(
-        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    val rawEngineFrames: SharedFlow<ByteArray> = _rawEngineFrames.asSharedFlow()
+    private val _navHistory = MutableStateFlow(RingSnapshot.EMPTY)
+    val navHistory: StateFlow<RingSnapshot> = _navHistory.asStateFlow()
 
-    private val _rawBatteryFrames = MutableSharedFlow<ByteArray>(
-        replay = 0, extraBufferCapacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    val rawBatteryFrames: SharedFlow<ByteArray> = _rawBatteryFrames.asSharedFlow()
+    private val _engineHistory = MutableStateFlow(RingSnapshot.EMPTY)
+    val engineHistory: StateFlow<RingSnapshot> = _engineHistory.asStateFlow()
+
+    private val _batteryHistory = MutableStateFlow(RingSnapshot.EMPTY)
+    val batteryHistory: StateFlow<RingSnapshot> = _batteryHistory.asStateFlow()
+
+    private var lastNavPublishMs = 0L
+    private var lastEnginePublishMs = 0L
+    private var lastBatteryPublishMs = 0L
+
+    // Timestamp of the most recent *real* append per stream. The gap-filler
+    // ticker compares against these to decide whether silence has passed
+    // and a sentinel should be inserted. @Volatile: written from the BLE
+    // collectors and the ticker, both on Dispatchers.Default.
+    @Volatile private var lastNavAppendMs = 0L
+    @Volatile private var lastEngineAppendMs = 0L
+    @Volatile private var lastBatteryAppendMs = 0L
 
     private val nmeaFlow = MutableSharedFlow<String>(
         replay = 0,
@@ -73,13 +128,100 @@ class NmeaForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Append-only disk persistence. Created once per service instance;
-    // writes happen from the raw-frame collectors below (same coroutine
-    // as the fan-out to _rawXxxFrames). Closed in onDestroy.
+    // writes happen from the BLE raw-frame collectors below alongside the
+    // in-memory ring append. Closed in onDestroy.
     private lateinit var historyLogger: uk.co.tfd.nmeabridge.history.persist.HistoryLogger
 
     override fun onCreate() {
         super.onCreate()
         historyLogger = uk.co.tfd.nmeabridge.history.persist.HistoryLogger(this)
+        // Gap-filler ticker. Fires every HISTORY_TICK_MS and inserts a
+        // sentinel into any stream that's been silent longer than its
+        // gap threshold. Only runs once there's been at least one real
+        // sample on a stream, so silent streams (e.g. engine on a non-
+        // BoatWatch source) don't accumulate filler.
+        serviceScope.launch {
+            while (isActive) {
+                delay(HISTORY_TICK_MS)
+                val now = System.currentTimeMillis()
+                if (lastNavAppendMs > 0 && now - lastNavAppendMs >= HISTORY_GAP_THRESHOLD_MS) {
+                    appendNavSentinel(now)
+                }
+                if (lastEngineAppendMs > 0 && now - lastEngineAppendMs >= HISTORY_GAP_THRESHOLD_MS) {
+                    appendEngineSentinel(now)
+                }
+                if (lastBatteryAppendMs > 0 && now - lastBatteryAppendMs >= BATTERY_GAP_THRESHOLD_MS) {
+                    appendBatterySentinel(now)
+                }
+            }
+        }
+    }
+
+    /**
+     * Append a raw nav wire frame (29 B, magic 0xCC) to the history ring,
+     * persist to disk, and republish a snapshot at most every
+     * HISTORY_PUBLISH_INTERVAL_MS.
+     */
+    private fun appendNav(frame: ByteArray) {
+        if (frame.size != BinaryProtocol.FRAME_SIZE) return
+        val now = System.currentTimeMillis()
+        navRing.append(now, frame)
+        historyLogger.nav.append(frame)
+        lastNavAppendMs = now
+        if (now - lastNavPublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+            lastNavPublishMs = now
+            _navHistory.value = navRing.snapshot()
+        }
+    }
+
+    private fun appendEngine(frame: ByteArray) {
+        if (frame.size != EngineProtocol.FRAME_SIZE) return
+        val now = System.currentTimeMillis()
+        engineRing.append(now, frame)
+        historyLogger.engine.append(frame)
+        lastEngineAppendMs = now
+        if (now - lastEnginePublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+            lastEnginePublishMs = now
+            _engineHistory.value = engineRing.snapshot()
+        }
+    }
+
+    private fun appendBattery(wireFrame: ByteArray) {
+        // BMS frames are variable-length on the wire; canonicalise to
+        // the fixed 48 B history slot before logging. Drop malformed
+        // frames silently (encodeHistorySlot returns null).
+        val slot = BmsProtocol.encodeHistorySlot(wireFrame) ?: return
+        val now = System.currentTimeMillis()
+        batteryRing.append(now, slot)
+        historyLogger.bms.append(slot)
+        lastBatteryAppendMs = now
+        if (now - lastBatteryPublishMs >= HISTORY_PUBLISH_INTERVAL_MS) {
+            lastBatteryPublishMs = now
+            _batteryHistory.value = batteryRing.snapshot()
+        }
+    }
+
+    /**
+     * Append a sentinel frame + republish snapshot. Used by the gap-filler
+     * to keep the time axis contiguous when the source stream has stopped.
+     * Doesn't update lastXxxAppendMs — the stream is still silent.
+     */
+    private fun appendNavSentinel(now: Long) {
+        navRing.append(now, BinaryProtocol.SENTINEL_FRAME)
+        lastNavPublishMs = now
+        _navHistory.value = navRing.snapshot()
+    }
+
+    private fun appendEngineSentinel(now: Long) {
+        engineRing.append(now, EngineProtocol.SENTINEL_FRAME)
+        lastEnginePublishMs = now
+        _engineHistory.value = engineRing.snapshot()
+    }
+
+    private fun appendBatterySentinel(now: Long) {
+        batteryRing.append(now, BmsProtocol.SENTINEL_SLOT)
+        lastBatteryPublishMs = now
+        _batteryHistory.value = batteryRing.snapshot()
     }
 
     inner class LocalBinder : Binder() {
@@ -176,34 +318,19 @@ class NmeaForegroundService : Service() {
                     _state.update { it.copy(engineState = engine) }
                 }
             }
-            // Forward raw wire frames from the BLE source to service-level
-            // SharedFlows so the VM (or any other service consumer) can
-            // maintain wire-format history rings without binding to the
-            // source directly.
-            // Fan out raw frames to (a) in-memory VM history and
-            // (b) append-only disk log. The disk writer rotates files
-            // at midnight UTC and pads sentinel slots across gaps.
+            // Feed raw wire frames into the in-memory history rings
+            // (which also persist to disk via historyLogger). Rings live
+            // on the service so they survive Activity recreation —
+            // viewmodel rebinds re-read the latest snapshot from the
+            // history StateFlows.
             serviceScope.launch {
-                source.rawNavFrames.collect {
-                    _rawNavFrames.tryEmit(it)
-                    historyLogger.nav.append(it)
-                }
+                source.rawNavFrames.collect { appendNav(it) }
             }
             serviceScope.launch {
-                source.rawEngineFrames.collect {
-                    _rawEngineFrames.tryEmit(it)
-                    historyLogger.engine.append(it)
-                }
+                source.rawEngineFrames.collect { appendEngine(it) }
             }
             serviceScope.launch {
-                source.rawBatteryFrames.collect {
-                    _rawBatteryFrames.tryEmit(it)
-                    // BMS is variable-length on the wire; canonicalise to
-                    // the fixed 48 B history slot before logging. Any
-                    // malformed frame (too short etc.) is dropped.
-                    val slot = uk.co.tfd.nmeabridge.nmea.BmsProtocol.encodeHistorySlot(it)
-                    if (slot != null) historyLogger.bms.append(slot)
-                }
+                source.rawBatteryFrames.collect { appendBattery(it) }
             }
         }
 

@@ -312,20 +312,30 @@ class BleNmeaSource(
     }
 
     private fun handleNotification(charUuid: UUID, value: ByteArray) {
-        if (charUuid == BW_AUTOPILOT_UUID && value.size >= 2 && value[0] == MAGIC_AUTH_RESP) {
-            val accepted = value[1] == 0x01.toByte()
-            if (accepted) {
-                authenticated = true
-                onConnectionStateChanged(true, null)
-                // Kick off any subscriptions the user requested before auth completed
-                if (batteryWanted && !batterySubscribed) {
-                    handler.post { applyBatterySubscription(true) }
+        if (charUuid == BW_AUTOPILOT_UUID) {
+            // AA01 carries two distinct message types: 0xAF auth response,
+            // and 0xAA autopilot state (10 B current/target heading). The
+            // app only needs the auth response today; state messages are
+            // dropped here. They MUST NOT fall through into the FF01 nav
+            // accumulator — the 10-byte state frames contain a 0xCC byte
+            // whenever the heading low byte is 0xCC, and three concatenated
+            // states would otherwise be stitched into a synthetic 29-byte
+            // "nav frame" full of garbage values.
+            if (value.size >= 2 && value[0] == MAGIC_AUTH_RESP) {
+                val accepted = value[1] == 0x01.toByte()
+                if (accepted) {
+                    authenticated = true
+                    onConnectionStateChanged(true, null)
+                    // Kick off any subscriptions the user requested before auth completed
+                    if (batteryWanted && !batterySubscribed) {
+                        handler.post { applyBatterySubscription(true) }
+                    }
+                    if (engineWanted && !engineSubscribed) {
+                        handler.post { applyEngineSubscription(true) }
+                    }
+                } else {
+                    onConnectionStateChanged(false, "Authentication failed: wrong PIN")
                 }
-                if (engineWanted && !engineSubscribed) {
-                    handler.post { applyEngineSubscription(true) }
-                }
-            } else {
-                onConnectionStateChanged(false, "Authentication failed: wrong PIN")
             }
             return
         }
@@ -349,7 +359,12 @@ class BleNmeaSource(
             }
             return
         }
-        processIncomingBytes(value)
+        // Only the nav characteristic feeds the 29-byte 0xCC accumulator;
+        // bytes from any other source could resync onto a stray 0xCC and
+        // produce a fake nav frame.
+        if (charUuid == NMEA_NOTIFY_UUID) {
+            processIncomingBytes(value)
+        }
     }
 
     @SuppressLint("MissingPermission")
