@@ -215,17 +215,6 @@ fun EngineMetricChart(
     }
 }
 
-// Binary-search for the logical index whose timestamp is closest to tMs.
-// Returns -1 when the snapshot is empty.
-private fun nearestIndex(s: RingSnapshot, tMs: Long): Int {
-    if (s.size == 0) return -1
-    val lo = s.lowerBound(tMs).coerceIn(0, s.size - 1)
-    if (lo == 0) return 0
-    val tLo = s.timestampAt(lo)
-    val tPrev = s.timestampAt(lo - 1)
-    return if (kotlin.math.abs(tLo - tMs) <= kotlin.math.abs(tPrev - tMs)) lo else lo - 1
-}
-
 private fun toAndroidColor(c: Color): Int {
     return android.graphics.Color.argb(
         (c.alpha * 255).toInt(),

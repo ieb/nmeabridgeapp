@@ -120,6 +120,11 @@ fun AppBottomBar(
                     icon = { BatteryIcon(it) }
                 )
                 NavButton(
+                    selected = current == Screen.HISTORY,
+                    onClick = { viewModel.setCurrentScreen(Screen.HISTORY) },
+                    icon = { HistoryIcon(it) }
+                )
+                NavButton(
                     selected = current == Screen.SETTINGS,
                     onClick = { viewModel.setCurrentScreen(Screen.SETTINGS) },
                     icon = {
@@ -300,6 +305,43 @@ private fun BatteryIcon(tint: Color) {
                 height = (bodyBottom - fillTop) - sw / 2f,
             )
         )
+    }
+}
+
+/**
+ * History icon — three rising line-graph traces inside an axis frame.
+ * Conveys "stored telemetry over time".
+ */
+@Composable
+private fun HistoryIcon(tint: Color) {
+    Canvas(modifier = Modifier.size(ICON_SIZE)) {
+        val w = size.width
+        val h = size.height
+        val sw = w * 0.08f
+        val left = w * 0.18f
+        val right = w * 0.86f
+        val top = h * 0.18f
+        val bottom = h * 0.82f
+        // Axis frame: left + bottom only.
+        drawLine(tint, Offset(left, top), Offset(left, bottom), strokeWidth = sw)
+        drawLine(tint, Offset(left, bottom), Offset(right, bottom), strokeWidth = sw)
+        // Three short series lines inside the frame.
+        val plotW = right - left
+        val plotH = bottom - top
+        fun pt(x: Float, y: Float) = Offset(left + plotW * x, bottom - plotH * y)
+        val series1 = Path().apply {
+            moveTo(pt(0.05f, 0.20f).x, pt(0.05f, 0.20f).y)
+            lineTo(pt(0.30f, 0.50f).x, pt(0.30f, 0.50f).y)
+            lineTo(pt(0.55f, 0.40f).x, pt(0.55f, 0.40f).y)
+            lineTo(pt(0.95f, 0.80f).x, pt(0.95f, 0.80f).y)
+        }
+        val series2 = Path().apply {
+            moveTo(pt(0.05f, 0.55f).x, pt(0.05f, 0.55f).y)
+            lineTo(pt(0.40f, 0.30f).x, pt(0.40f, 0.30f).y)
+            lineTo(pt(0.95f, 0.55f).x, pt(0.95f, 0.55f).y)
+        }
+        drawPath(series1, tint, style = Stroke(width = sw * 0.85f))
+        drawPath(series2, tint, style = Stroke(width = sw * 0.85f))
     }
 }
 

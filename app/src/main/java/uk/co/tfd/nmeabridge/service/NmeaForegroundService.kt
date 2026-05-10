@@ -13,6 +13,7 @@ import uk.co.tfd.nmeabridge.bluetooth.BleNmeaSource
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothGpsSource
 import uk.co.tfd.nmeabridge.history.FrameRing
+import uk.co.tfd.nmeabridge.history.HistoryDataSource
 import uk.co.tfd.nmeabridge.history.RingSnapshot
 import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
 import uk.co.tfd.nmeabridge.nmea.BmsProtocol
@@ -131,6 +132,15 @@ class NmeaForegroundService : Service() {
     // writes happen from the BLE raw-frame collectors below alongside the
     // in-memory ring append. Closed in onDestroy.
     private lateinit var historyLogger: uk.co.tfd.nmeabridge.history.persist.HistoryLogger
+
+    /**
+     * Read-only view onto the same files the historyLogger writes. Lives
+     * on the service so its window cache survives Activity recreation,
+     * the same reason the history rings moved here.
+     */
+    val historyDataSource: HistoryDataSource by lazy {
+        HistoryDataSource(historyLogger.directory)
+    }
 
     override fun onCreate() {
         super.onCreate()

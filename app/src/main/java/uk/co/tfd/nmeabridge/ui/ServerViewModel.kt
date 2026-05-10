@@ -43,7 +43,7 @@ data class BleScannedDevice(
  * the Activity on window focus changes without killing the process, which
  * would otherwise reset the user to NAV every time they Alt-Tab back).
  */
-enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS, POLAR }
+enum class Screen { NAV, SETTINGS, BLE_TEST, BATTERY, ENGINE, ENGINE_GRAPHS, POLAR, HISTORY }
 
 class ServerViewModel : ViewModel() {
 
@@ -54,7 +54,16 @@ class ServerViewModel : ViewModel() {
         private const val KEY_BLE_ADDRESS = "ble_address"
         private const val KEY_BT_ADDRESS = "bt_address"
         private const val KEY_BLE_PIN = "ble_pin"
+        private const val KEY_HISTORY_LAYOUT = "history_layout"     // JSON
+        private const val KEY_HISTORY_WINDOW_MS = "history_window_ms"
+        private const val KEY_HISTORY_END_MS = "history_end_ms"     // -1 = live
         private val NAV_SERVICE_PARCEL = ParcelUuid(BleNmeaSource.NMEA_SERVICE_UUID)
+
+        /** Default chart layout shown the first time the user opens the History screen. */
+        private val DEFAULT_HISTORY_LAYOUT: List<HistoryChartConfig> = listOf(
+            HistoryChartConfig(),  // one empty chart, user adds series via the picker
+        )
+        private const val DEFAULT_HISTORY_WINDOW_MS = 5L * 60 * 1000   // 5 min
     }
 
     private val _serviceState = MutableStateFlow(ServiceState())
@@ -82,6 +91,20 @@ class ServerViewModel : ViewModel() {
 
     private val _batteryHistory = MutableStateFlow(RingSnapshot.EMPTY)
     val batteryHistory: StateFlow<RingSnapshot> = _batteryHistory.asStateFlow()
+
+    // History-screen layout. Persisted across app launches so users don't
+    // have to rebuild their preferred set of charts every time. Each
+    // mutator immediately persists; load happens on first call to
+    // loadSettings().
+    private val _historyCharts = MutableStateFlow(DEFAULT_HISTORY_LAYOUT)
+    val historyCharts: StateFlow<List<HistoryChartConfig>> = _historyCharts.asStateFlow()
+
+    private val _historyWindowMs = MutableStateFlow(DEFAULT_HISTORY_WINDOW_MS)
+    val historyWindowMs: StateFlow<Long> = _historyWindowMs.asStateFlow()
+
+    /** null = pinned to the latest live data. */
+    private val _historyEndMs = MutableStateFlow<Long?>(null)
+    val historyEndMs: StateFlow<Long?> = _historyEndMs.asStateFlow()
 
     private val _port = MutableStateFlow(10110)
     val port: StateFlow<Int> = _port.asStateFlow()
@@ -150,10 +173,20 @@ class ServerViewModel : ViewModel() {
     private var service: NmeaForegroundService? = null
     private var bound = false
 
+    /**
+     * Lets Compose screens react to service connect / disconnect. Most
+     * VM state is mirrored from the service, but a few screens (the
+     * History screen) need direct service handles (its
+     * HistoryDataSource) and have to recompose when the service binds.
+     */
+    private val _boundService = MutableStateFlow<NmeaForegroundService?>(null)
+    val boundService: StateFlow<NmeaForegroundService?> = _boundService.asStateFlow()
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as NmeaForegroundService.LocalBinder).service
             bound = true
+            _boundService.value = service
             viewModelScope.launch {
                 service!!.state.collect { _serviceState.value = it }
             }
@@ -178,6 +211,7 @@ class ServerViewModel : ViewModel() {
         override fun onServiceDisconnected(name: ComponentName) {
             service = null
             bound = false
+            _boundService.value = null
         }
     }
 
@@ -200,6 +234,88 @@ class ServerViewModel : ViewModel() {
                 _sourceType.value = SourceType.valueOf(sourceStr)
             } catch (_: Exception) {}
         }
+        // History layout
+        _historyWindowMs.value = prefs.getLong(KEY_HISTORY_WINDOW_MS, DEFAULT_HISTORY_WINDOW_MS)
+        val savedEnd = prefs.getLong(KEY_HISTORY_END_MS, -1L)
+        _historyEndMs.value = if (savedEnd <= 0L) null else savedEnd
+        prefs.getString(KEY_HISTORY_LAYOUT, null)?.let { json ->
+            try {
+                _historyCharts.value = HistoryLayoutCodec.decode(json).ifEmpty { DEFAULT_HISTORY_LAYOUT }
+            } catch (_: Exception) {
+                _historyCharts.value = DEFAULT_HISTORY_LAYOUT
+            }
+        }
+    }
+
+    private fun saveHistoryLayout(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(KEY_HISTORY_LAYOUT, HistoryLayoutCodec.encode(_historyCharts.value))
+            .putLong(KEY_HISTORY_WINDOW_MS, _historyWindowMs.value)
+            .putLong(KEY_HISTORY_END_MS, _historyEndMs.value ?: -1L)
+            .apply()
+    }
+
+    /** Insert a new empty chart at the end of the layout. */
+    fun addHistoryChart(context: Context) {
+        _historyCharts.value = _historyCharts.value + HistoryChartConfig()
+        saveHistoryLayout(context)
+    }
+
+    /** Remove chart at the given index. No-op if index out of bounds. */
+    fun removeHistoryChart(context: Context, index: Int) {
+        val cur = _historyCharts.value
+        if (index !in cur.indices) return
+        _historyCharts.value = cur.toMutableList().apply { removeAt(index) }
+        saveHistoryLayout(context)
+    }
+
+    /** Add a series to a chart, auto-assigning to left or right axis by unit group. */
+    fun addHistorySeries(
+        context: Context,
+        chartIndex: Int,
+        fieldId: String,
+        colorArgb: Int,
+    ): Boolean {
+        val cur = _historyCharts.value
+        if (chartIndex !in cur.indices) return false
+        val field = HistoryFieldCatalog.byId(fieldId) ?: return false
+        val chart = cur[chartIndex]
+        val leftUnit = chart.left.firstOrNull()?.let { HistoryFieldCatalog.byId(it.fieldId)?.unit }
+        val rightUnit = chart.right.firstOrNull()?.let { HistoryFieldCatalog.byId(it.fieldId)?.unit }
+        val ref = HistorySeriesRef(fieldId = fieldId, colorArgb = colorArgb)
+        val updated = when {
+            leftUnit == null -> chart.copy(left = chart.left + ref)              // empty chart → left
+            leftUnit == field.unit -> chart.copy(left = chart.left + ref)
+            rightUnit == null -> chart.copy(right = chart.right + ref)           // open right axis
+            rightUnit == field.unit -> chart.copy(right = chart.right + ref)
+            else -> return false                                                  // both axes incompatible
+        }
+        _historyCharts.value = cur.toMutableList().apply { set(chartIndex, updated) }
+        saveHistoryLayout(context)
+        return true
+    }
+
+    /** Remove a series from a chart by its position in the combined left+right list. */
+    fun removeHistorySeries(context: Context, chartIndex: Int, fieldId: String) {
+        val cur = _historyCharts.value
+        if (chartIndex !in cur.indices) return
+        val chart = cur[chartIndex]
+        val updated = chart.copy(
+            left = chart.left.filterNot { it.fieldId == fieldId },
+            right = chart.right.filterNot { it.fieldId == fieldId },
+        )
+        _historyCharts.value = cur.toMutableList().apply { set(chartIndex, updated) }
+        saveHistoryLayout(context)
+    }
+
+    fun setHistoryWindowMs(context: Context, ms: Long) {
+        _historyWindowMs.value = ms
+        saveHistoryLayout(context)
+    }
+
+    fun setHistoryEndMs(context: Context, ms: Long?) {
+        _historyEndMs.value = ms
+        saveHistoryLayout(context)
     }
 
     private fun saveSettings(context: Context) {
@@ -222,6 +338,7 @@ class ServerViewModel : ViewModel() {
             context.unbindService(connection)
             bound = false
             service = null
+            _boundService.value = null
         }
     }
 

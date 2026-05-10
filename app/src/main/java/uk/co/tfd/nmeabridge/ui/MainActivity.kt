@@ -76,6 +76,7 @@ class MainActivity : ComponentActivity() {
                         Screen.NAV -> NavigationScreen(viewModel = viewModel)
                         Screen.POLAR -> PolarScreen(viewModel = viewModel)
                         Screen.BATTERY -> BatteryScreen(viewModel = viewModel)
+                        Screen.HISTORY -> HistoryScreen(viewModel = viewModel)
                         Screen.ENGINE -> EngineScreen(
                             viewModel = viewModel,
                             onGraphs = { viewModel.setCurrentScreen(Screen.ENGINE_GRAPHS) }

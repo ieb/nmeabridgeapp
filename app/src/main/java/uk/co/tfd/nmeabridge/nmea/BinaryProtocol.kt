@@ -226,6 +226,76 @@ object BinaryProtocol {
         u32OrNull(s.readU32(i, OFF_LOG))?.let { it * M_TO_NM }
 
     /**
+     * Detect a 29-byte "nav" frame that is in fact three concatenated
+     * 10-byte autopilot state messages — the artefact of a BLE frame-
+     * accumulator bug (see the 2026-05-10 fix to
+     * `BleNmeaSource.handleNotification`). Records written before that
+     * fix sit in `nav-YYYY-MM-DD.bin` files; readers drop them so the
+     * chart isn't polluted by their wildly out-of-range synthetic
+     * field values.
+     *
+     * The slow-path BLE accumulator latched onto whichever `0xCC` byte
+     * happened to fall first within the autopilot byte stream. In a
+     * normal autopilot frame
+     *
+     *   `[AA][mode][hdg_lo][hdg_hi][tgt_lo][tgt_hi][wind_lo][wind_hi][00][00]`
+     *
+     * `0xCC` can plausibly appear at offsets **2** (hdg_lo), **4**
+     * (tgt_lo), **6** (wind_lo) or **7** (wind_hi). For each latch
+     * offset `k`, the next msg's `AA` magic byte lands at frame offset
+     * `10 - k`, and successive msgs at `+10` from there. So the AA
+     * stride-10 fingerprint can land at any of:
+     *
+     *   k=2 → AA at 8, 18, 28
+     *   k=4 → AA at 6, 16, 26
+     *   k=6 → AA at 4, 14, 24
+     *   k=7 → AA at 3, 13, 23
+     *
+     * The byte right after each `AA` is the autopilot mode (0..3 in
+     * the firmware) and the two bytes right before it are the
+     * mandatory `0x00 0x00` reserved tail of the previous msg. We
+     * check all of those to keep the false-positive rate negligible
+     * on real nav frames.
+     */
+    fun isCorruptAutopilotStitch(frame: ByteArray): Boolean {
+        if (frame.size != FRAME_SIZE) return false
+        if (frame[0] != MAGIC) return false
+        for (k in 2..7) {
+            if (matchesStitchAt(frame, k)) return true
+        }
+        return false
+    }
+
+    private fun matchesStitchAt(frame: ByteArray, k: Int): Boolean {
+        val a1 = 10 - k
+        val a2 = 20 - k
+        val a3 = 30 - k                 // 23..28 for k in 2..7
+        // Three autopilot magic bytes at stride 10 from a1.
+        if (frame[a1] != AP_MAGIC) return false
+        if (frame[a2] != AP_MAGIC) return false
+        if (a3 in 0 until FRAME_SIZE && frame[a3] != AP_MAGIC) return false
+        // Mode (0..3) immediately after each magic, when it lies in-frame.
+        if (!isAutopilotMode(frame, a1 + 1)) return false
+        if (!isAutopilotMode(frame, a2 + 1)) return false
+        if (!isAutopilotMode(frame, a3 + 1)) return false
+        // Two reserved 0x00 bytes immediately before each magic, when
+        // they lie in-frame. (For k=7 the first AA is at offset 3 so
+        // only one reserved byte is in-frame; that's still checked.)
+        if (!isZero(frame, a1 - 1) || !isZero(frame, a1 - 2)) return false
+        if (!isZero(frame, a2 - 1) || !isZero(frame, a2 - 2)) return false
+        if (!isZero(frame, a3 - 1) || !isZero(frame, a3 - 2)) return false
+        return true
+    }
+
+    private fun isAutopilotMode(frame: ByteArray, at: Int): Boolean =
+        at < 0 || at >= FRAME_SIZE || (frame[at].toInt() and 0xFF) in 0..3
+
+    private fun isZero(frame: ByteArray, at: Int): Boolean =
+        at < 0 || at >= FRAME_SIZE || frame[at] == 0.toByte()
+
+    private const val AP_MAGIC: Byte = 0xAA.toByte()
+
+    /**
      * 29 B sentinel frame used by the gap-filler ticker when no nav frame
      * arrived in the current second. Each field encoded with its specific
      * "not available" value: 0x7FFFFFFF for S32 (lat/lon), 0x7FFF for S16
