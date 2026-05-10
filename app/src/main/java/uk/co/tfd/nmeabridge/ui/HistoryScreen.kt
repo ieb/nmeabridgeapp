@@ -54,6 +54,7 @@ import androidx.compose.foundation.shape.CircleShape
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import uk.co.tfd.nmeabridge.history.HistoryWindowSnapshot
+import uk.co.tfd.nmeabridge.history.playback.PlaybackEngine
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -72,6 +73,10 @@ fun HistoryScreen(viewModel: ServerViewModel) {
     val endMs by viewModel.historyEndMs.collectAsState()
     val polar by viewModel.activePolar.collectAsState()
     val state by viewModel.serviceState.collectAsState()
+    val playbackState by viewModel.playbackState.collectAsState()
+    val playbackPositionMs by viewModel.playbackPositionMs.collectAsState()
+    val playbackSpeed by viewModel.playbackSpeed.collectAsState()
+    val playbackActive = playbackState != uk.co.tfd.nmeabridge.history.playback.PlaybackEngine.State.STOPPED
 
     // Resolve the window. tEnd-now if live, otherwise the persisted endMs.
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -90,6 +95,12 @@ fun HistoryScreen(viewModel: ServerViewModel) {
     var crosshairMs by remember { mutableStateOf<Long?>(null) }
     var plotLeftPx by remember { mutableFloatStateOf(0f) }
     var plotWidthPx by remember { mutableFloatStateOf(1f) }
+
+    // While playback is active, the cursor IS the playhead — it follows
+    // the engine's position regardless of mouse motion. While the engine
+    // is stopped, the cursor follows the user's hover/tap as before.
+    val effectiveCrosshair: Long? = if (playbackActive) playbackPositionMs else crosshairMs
+    val playbackActiveState by rememberUpdatedState(playbackActive)
 
     // Pull a fresh snapshot whenever the window or chart layout changes.
     val dataSource = viewModel.historyDataSource()
@@ -138,13 +149,28 @@ fun HistoryScreen(viewModel: ServerViewModel) {
             HistoryToolbar(
                 windowMs = windowMs,
                 isLive = endMs == null,
-                crosshairMs = crosshairMs,
+                crosshairMs = effectiveCrosshair,
+                playbackState = playbackState,
+                playbackSpeed = playbackSpeed,
                 onAddChart = { viewModel.addHistoryChart(context) },
                 onResetView = {
                     viewModel.setHistoryEndMs(context, null)
                     viewModel.setHistoryWindowMs(context, DEFAULT_WINDOW_MS)
-                    crosshairMs = null
+                    if (!playbackActive) crosshairMs = null
                 },
+                onPlayPause = {
+                    when (playbackState) {
+                        PlaybackEngine.State.STOPPED -> {
+                            // Start at the current crosshair if pinned,
+                            // otherwise start at the latest sample (= now-ish).
+                            val start = effectiveCrosshair ?: tEnd
+                            viewModel.startPlayback(start)
+                        }
+                        else -> viewModel.togglePauseResume()
+                    }
+                },
+                onStopPlayback = { viewModel.stopPlayback() },
+                onSpeedSelected = { viewModel.setPlaybackSpeed(it) },
             )
 
             // Show server-not-running notice but keep the layout visible —
@@ -190,19 +216,33 @@ fun HistoryScreen(viewModel: ServerViewModel) {
                     }
                     .pointerInput(Unit) {
                         detectTapGestures(
-                            onTap = { offset -> crosshairMs = pxToMs(offset.x) },
+                            onTap = { offset ->
+                                val ms = pxToMs(offset.x)
+                                if (playbackActiveState) {
+                                    // While playing/paused, tap seeks
+                                    // the playhead instead of moving a
+                                    // hover crosshair.
+                                    viewModel.seekPlayback(ms)
+                                } else {
+                                    crosshairMs = ms
+                                }
+                            },
                             onDoubleTap = {
                                 viewModel.setHistoryEndMs(context, null)
                                 viewModel.setHistoryWindowMs(context, DEFAULT_WINDOW_MS)
-                                crosshairMs = null
+                                if (!playbackActiveState) crosshairMs = null
                             },
                         )
                     }
                     .pointerInput(Unit) {
-                        // Hover (Chromebook trackpad) tracking for the crosshair.
+                        // Hover (Chromebook trackpad) tracking for the
+                        // crosshair. Suppressed during playback — the
+                        // cursor IS the playhead and the user shouldn't
+                        // be able to drag it sideways with the mouse.
                         awaitPointerEventScope {
                             while (true) {
                                 val ev = awaitPointerEvent()
+                                if (playbackActiveState) continue
                                 when (ev.type) {
                                     PointerEventType.Move -> {
                                         val anyPressed = ev.changes.any { it.pressed }
@@ -232,7 +272,7 @@ fun HistoryScreen(viewModel: ServerViewModel) {
                             polar = polar,
                             tStart = tStart,
                             tEnd = tEnd,
-                            crosshairMs = crosshairMs,
+                            crosshairMs = effectiveCrosshair,
                             onAddSeriesClick = { pickerForChart = idx },
                             onRemoveSeries = { fieldId ->
                                 viewModel.removeHistorySeries(context, idx, fieldId)
@@ -273,9 +313,15 @@ private fun HistoryToolbar(
     windowMs: Long,
     isLive: Boolean,
     crosshairMs: Long?,
+    playbackState: PlaybackEngine.State,
+    playbackSpeed: Int,
     onAddChart: () -> Unit,
     onResetView: () -> Unit,
+    onPlayPause: () -> Unit,
+    onStopPlayback: () -> Unit,
+    onSpeedSelected: (Int) -> Unit,
 ) {
+    val playbackActive = playbackState != PlaybackEngine.State.STOPPED
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -293,8 +339,14 @@ private fun HistoryToolbar(
             fontFamily = FontFamily.Monospace,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        // State chip: shows playback state if active, otherwise the
+        // hover crosshair time (or "live" / "paused" for the chart
+        // viewport — separate from playback).
         Text(
             text = when {
+                playbackActive && crosshairMs != null ->
+                    (if (playbackState == PlaybackEngine.State.PLAYING) "▶ " else "⏸ ") +
+                        crosshairTimeFmt.format(Date(crosshairMs))
                 crosshairMs != null -> "⎔ " + crosshairTimeFmt.format(Date(crosshairMs))
                 isLive -> "● live"
                 else -> "paused"
@@ -303,14 +355,42 @@ private fun HistoryToolbar(
             fontFamily = FontFamily.Monospace,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Spacer(Modifier.width(8.dp).then(Modifier))
-        TextButton(onClick = onResetView) {
-            Text("Reset", fontSize = 11.sp)
-        }
+        Spacer(Modifier.weight(1f))
+        TextButton(onClick = onResetView) { Text("Reset", fontSize = 11.sp) }
         TextButton(onClick = onAddChart) {
             Icon(Icons.Filled.Add, contentDescription = "Add chart", modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.width(2.dp))
             Text("Chart", fontSize = 11.sp)
+        }
+        // Play/pause toggle.
+        TextButton(onClick = onPlayPause) {
+            Text(
+                text = when (playbackState) {
+                    PlaybackEngine.State.PLAYING -> "⏸"
+                    else -> "▶"
+                },
+                fontSize = 14.sp,
+            )
+        }
+        // Stop only when there's something to stop.
+        if (playbackActive) {
+            TextButton(onClick = onStopPlayback) {
+                Text(text = "■", fontSize = 14.sp)
+            }
+        }
+        // Speed chips. Inert label when STOPPED is fine — they don't
+        // affect anything until the user starts playback.
+        for (s in listOf(1, 2, 10)) {
+            val selected = s == playbackSpeed
+            TextButton(onClick = { onSpeedSelected(s) }) {
+                Text(
+                    text = "${s}×",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = if (selected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

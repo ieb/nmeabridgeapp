@@ -15,6 +15,7 @@ import uk.co.tfd.nmeabridge.bluetooth.BluetoothGpsSource
 import uk.co.tfd.nmeabridge.history.FrameRing
 import uk.co.tfd.nmeabridge.history.HistoryDataSource
 import uk.co.tfd.nmeabridge.history.RingSnapshot
+import uk.co.tfd.nmeabridge.history.playback.PlaybackEngine
 import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
 import uk.co.tfd.nmeabridge.nmea.BmsProtocol
 import uk.co.tfd.nmeabridge.nmea.EngineProtocol
@@ -118,11 +119,47 @@ class NmeaForegroundService : Service() {
     @Volatile private var lastEngineAppendMs = 0L
     @Volatile private var lastBatteryAppendMs = 0L
 
-    private val nmeaFlow = MutableSharedFlow<String>(
+    // Sentences from the live source (BLE / Bluetooth-Classic GPS / sim).
+    // The live source pushes here unconditionally; whether they reach the
+    // TCP server is decided by [playbackActive] downstream.
+    private val liveSentences = MutableSharedFlow<String>(
         replay = 0,
         extraBufferCapacity = 64,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
+
+    // Sentences from the playback engine (history-file replay). Same
+    // gating as above — only routed to TCP when [playbackActive] is true.
+    private val playbackSentences = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    // What the TCP server actually broadcasts. Fed by either the live
+    // source or the playback engine, depending on [playbackActive].
+    private val tcpOutput = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    /**
+     * When true, live source emissions are dropped and playback engine
+     * emissions are routed to TCP. Toggled by [startPlayback] /
+     * [stopPlayback]. @Volatile so the multiplexer coroutines below
+     * see the latest value without synchronisation.
+     */
+    @Volatile private var playbackActive: Boolean = false
+
+    private val _playbackState = MutableStateFlow(PlaybackEngine.State.STOPPED)
+    val playbackState: StateFlow<PlaybackEngine.State> = _playbackState.asStateFlow()
+
+    private val _playbackPositionMs = MutableStateFlow(0L)
+    val playbackPositionMs: StateFlow<Long> = _playbackPositionMs.asStateFlow()
+
+    private val _playbackSpeed = MutableStateFlow(1)
+    val playbackSpeed: StateFlow<Int> = _playbackSpeed.asStateFlow()
 
     private var tcpServer: NmeaTcpServer? = null
     private var nmeaSource: NmeaSource? = null
@@ -142,9 +179,32 @@ class NmeaForegroundService : Service() {
         HistoryDataSource(historyLogger.directory)
     }
 
+    /**
+     * Replays recorded nav frames out as NMEA sentences when playback is
+     * active. Lazy so we don't create it (and pre-resolve the directory)
+     * until the user actually toggles playback. Survives Activity
+     * recreation along with the rest of the service.
+     */
+    private val playbackEngine: PlaybackEngine by lazy {
+        PlaybackEngine(
+            historyDir = historyLogger.directory,
+            sink = playbackSentences,
+            scope = serviceScope,
+        )
+    }
+
     override fun onCreate() {
         super.onCreate()
         historyLogger = uk.co.tfd.nmeabridge.history.persist.HistoryLogger(this)
+        // Multiplex live ↔ playback sentence flows into a single
+        // tcpOutput flow that the TCP server collects. The active flag
+        // decides which one is forwarded; the other is dropped.
+        serviceScope.launch {
+            liveSentences.collect { if (!playbackActive) tcpOutput.tryEmit(it) }
+        }
+        serviceScope.launch {
+            playbackSentences.collect { if (playbackActive) tcpOutput.tryEmit(it) }
+        }
         // Gap-filler ticker. Fires every HISTORY_TICK_MS and inserts a
         // sentinel into any stream that's been silent longer than its
         // gap threshold. Only runs once there's been at least one real
@@ -258,7 +318,7 @@ class NmeaForegroundService : Service() {
         acquireWakeLock()
 
         // Set up TCP server
-        val server = NmeaTcpServer(port, nmeaFlow, serviceScope) { clientCount ->
+        val server = NmeaTcpServer(port, tcpOutput, serviceScope) { clientCount ->
             _state.update { it.copy(connectedClients = clientCount) }
         }
         tcpServer = server
@@ -349,7 +409,7 @@ class NmeaForegroundService : Service() {
         serviceScope.launch {
             var count = 0L
             val recent = ArrayDeque<String>(12)
-            nmeaFlow.collect { sentence ->
+            tcpOutput.collect { sentence ->
                 count++
                 if (recent.size >= 12) recent.removeFirst()
                 recent.addLast(sentence)
@@ -374,7 +434,7 @@ class NmeaForegroundService : Service() {
         // Launch NMEA source
         serviceScope.launch {
             try {
-                source.start(nmeaFlow)
+                source.start(liveSentences)
             } catch (e: Exception) {
                 _state.update { it.copy(errorMessage = "NMEA source error: ${e.message}") }
             }
@@ -422,6 +482,57 @@ class NmeaForegroundService : Service() {
      */
     fun setWifiEnabled(enabled: Boolean) {
         (nmeaSource as? BleNmeaSource)?.sendWifiCommand(enabled)
+    }
+
+    // ---- Playback control surface --------------------------------
+
+    /**
+     * Switch the TCP NMEA output from the live source to playback,
+     * starting at [positionMs] (UTC ms) at [speedX] (1 / 2 / 10).
+     * Live emissions stop reaching the TCP server immediately;
+     * playback emissions start arriving on the next engine tick.
+     *
+     * Calling this while playback is already running just seeks +
+     * sets speed; the TCP stream stays continuous.
+     */
+    fun startPlayback(positionMs: Long, speedX: Int = 1) {
+        playbackActive = true
+        playbackEngine.start(positionMs, speedX)
+        // Mirror engine state into our public StateFlows so VM can
+        // bind to them. These collectors are launched lazily via
+        // ensurePlaybackMirrors so they live for the service's
+        // lifetime once started.
+        ensurePlaybackMirrors()
+    }
+
+    fun pausePlayback() = playbackEngine.pause()
+    fun resumePlayback() = playbackEngine.resume()
+    fun seekPlayback(positionMs: Long) = playbackEngine.seek(positionMs)
+    fun setPlaybackSpeed(speedX: Int) = playbackEngine.setSpeed(speedX)
+
+    /**
+     * End playback and route live source sentences to TCP again.
+     * Idempotent.
+     */
+    fun stopPlayback() {
+        playbackActive = false
+        playbackEngine.stop()
+    }
+
+    @Volatile private var playbackMirrorsStarted: Boolean = false
+
+    private fun ensurePlaybackMirrors() {
+        if (playbackMirrorsStarted) return
+        playbackMirrorsStarted = true
+        serviceScope.launch {
+            playbackEngine.state.collect { _playbackState.value = it }
+        }
+        serviceScope.launch {
+            playbackEngine.positionMs.collect { _playbackPositionMs.value = it }
+        }
+        serviceScope.launch {
+            playbackEngine.speed.collect { _playbackSpeed.value = it }
+        }
     }
 
     override fun onDestroy() {

@@ -21,6 +21,7 @@ import uk.co.tfd.nmeabridge.bluetooth.BleNmeaSource
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceInfo
 import uk.co.tfd.nmeabridge.bluetooth.BluetoothDeviceSelector
 import uk.co.tfd.nmeabridge.history.RingSnapshot
+import uk.co.tfd.nmeabridge.history.playback.PlaybackEngine
 import uk.co.tfd.nmeabridge.nmea.PolarRepository
 import uk.co.tfd.nmeabridge.nmea.PolarTable
 import uk.co.tfd.nmeabridge.service.DebugState
@@ -91,6 +92,17 @@ class ServerViewModel : ViewModel() {
 
     private val _batteryHistory = MutableStateFlow(RingSnapshot.EMPTY)
     val batteryHistory: StateFlow<RingSnapshot> = _batteryHistory.asStateFlow()
+
+    // History playback state, mirrored from the service-side engine in
+    // onServiceConnected so the toolbar / chart cursor can react.
+    private val _playbackState = MutableStateFlow(PlaybackEngine.State.STOPPED)
+    val playbackState: StateFlow<PlaybackEngine.State> = _playbackState.asStateFlow()
+
+    private val _playbackPositionMs = MutableStateFlow(0L)
+    val playbackPositionMs: StateFlow<Long> = _playbackPositionMs.asStateFlow()
+
+    private val _playbackSpeed = MutableStateFlow(1)
+    val playbackSpeed: StateFlow<Int> = _playbackSpeed.asStateFlow()
 
     // History-screen layout. Persisted across app launches so users don't
     // have to rebuild their preferred set of charts every time. Each
@@ -205,6 +217,19 @@ class ServerViewModel : ViewModel() {
             }
             viewModelScope.launch {
                 service!!.batteryHistory.collect { _batteryHistory.value = it }
+            }
+            // Playback-engine mirrors. The engine's StateFlows are
+            // replay-1, so a fresh VM rebind picks up the latest values
+            // immediately — including a playback that's already running
+            // when the user re-opens the History screen.
+            viewModelScope.launch {
+                service!!.playbackState.collect { _playbackState.value = it }
+            }
+            viewModelScope.launch {
+                service!!.playbackPositionMs.collect { _playbackPositionMs.value = it }
+            }
+            viewModelScope.launch {
+                service!!.playbackSpeed.collect { _playbackSpeed.value = it }
             }
         }
 
@@ -427,6 +452,26 @@ class ServerViewModel : ViewModel() {
         _wifiEnabled.value = enabled
         service?.setWifiEnabled(enabled)
     }
+
+    // ---- Playback control bridges ----------------------------------
+
+    /** Start playback at [startPositionMs] with the currently-set speed. */
+    fun startPlayback(startPositionMs: Long) {
+        service?.startPlayback(startPositionMs, _playbackSpeed.value)
+    }
+
+    /** Toggle PLAYING ↔ PAUSED. No-op when playback is STOPPED. */
+    fun togglePauseResume() {
+        when (_playbackState.value) {
+            PlaybackEngine.State.PLAYING -> service?.pausePlayback()
+            PlaybackEngine.State.PAUSED -> service?.resumePlayback()
+            PlaybackEngine.State.STOPPED -> { /* caller should use startPlayback */ }
+        }
+    }
+
+    fun stopPlayback() = service?.stopPlayback()
+    fun seekPlayback(positionMs: Long) = service?.seekPlayback(positionMs)
+    fun setPlaybackSpeed(speedX: Int) = service?.setPlaybackSpeed(speedX)
 
     fun setActivePolar(name: String) {
         polarRepo?.setActive(name)

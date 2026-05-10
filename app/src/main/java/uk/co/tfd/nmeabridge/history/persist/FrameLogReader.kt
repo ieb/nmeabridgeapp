@@ -48,6 +48,56 @@ class FrameLogReader private constructor(
     }
 
     /**
+     * The wall-clock UTC ms of the **last** slot in the file (i.e. the
+     * latest record we can play back). Useful for clamping a seek
+     * target to "the most recent data available". Returns `null` when
+     * the file holds no records.
+     */
+    val lastSlotMs: Long?
+        get() = if (slotCount == 0) null else timestampMsOf(slotCount - 1)
+
+    /**
+     * The wall-clock UTC ms of the **first** slot in the file (≡
+     * `startTimeSec * 1000` for any non-empty file). Returns `null`
+     * when the file holds no records.
+     */
+    val firstSlotMs: Long?
+        get() = if (slotCount == 0) null else timestampMsOf(0)
+
+    /**
+     * Random-access lookup: return the slot whose timestamp is closest
+     * to `tMs` without exceeding it (i.e. the slot covering wall-clock
+     * `tMs`). Returns `null` when the file is empty or `tMs` is before
+     * the file's first slot. When `tMs` is past the end, returns the
+     * last slot — playback engines clamp to the end for end-of-data
+     * detection.
+     *
+     * `bytes` in the returned [Slot] is a fresh copy.
+     */
+    fun slotAt(tMs: Long): Slot? {
+        if (slotCount == 0) return null
+        val firstMs = timestampMsOf(0)
+        if (tMs < firstMs) return null
+        val idx = ((tMs - firstMs) / 1000L / secondsPerRecord)
+            .toInt()
+            .coerceIn(0, slotCount - 1)
+        return slotByIndex(idx)
+    }
+
+    /**
+     * Return the slot at logical index `slot`. Bounds-checked. Useful
+     * for callers that already track slot indices (e.g. step-by-step
+     * playback) and want to skip the timestamp arithmetic in
+     * [slotAt].
+     */
+    fun slotByIndex(slot: Int): Slot? {
+        if (slot !in 0 until slotCount) return null
+        val frameCopy = ByteArray(recordSize)
+        System.arraycopy(body, slot * recordSize, frameCopy, 0, recordSize)
+        return Slot(timestampMsOf(slot), frameCopy)
+    }
+
+    /**
      * Yield (timestampMs, frameBytes) for every `stride`th slot in the
      * file. `frameBytes` is a fresh copy on each emission, so the caller
      * may retain it. If `skipSentinel` is non-null, slots whose contents

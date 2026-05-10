@@ -234,6 +234,109 @@ class FrameLogReaderTest {
     }
 
     @Test
+    fun slotAt_returnsNull_forEmptyFile() {
+        // No records appended → slotAt always returns null.
+        val log = newLog()
+        log.close()
+        // An empty file contains only the 14-byte header.
+        FrameLogReader.open(fileFor("test"))?.use { r ->
+            // Empty file: no body to read.
+            assertEquals(0, r.slotCount)
+            assertNull(r.slotAt(MIDNIGHT_28_APR_2026_MS))
+            assertNull(r.lastSlotMs)
+            assertNull(r.firstSlotMs)
+        }
+    }
+
+    @Test
+    fun slotAt_beforeFirstSlot_returnsNull() {
+        val log = newLog()
+        clock.set(MIDNIGHT_28_APR_2026_MS + 5_000)
+        log.append(REAL_A)
+        log.close()
+        FrameLogReader.open(fileFor("test"))!!.use { r ->
+            // tMs strictly before the file's earliest slot (slot 0 = midnight).
+            assertNull(r.slotAt(MIDNIGHT_28_APR_2026_MS - 1_000))
+        }
+    }
+
+    @Test
+    fun slotAt_pastLastSlot_clampsToEnd() {
+        val log = newLog()
+        clock.set(MIDNIGHT_28_APR_2026_MS + 3_000)
+        log.append(REAL_A)
+        log.close()
+        FrameLogReader.open(fileFor("test"))!!.use { r ->
+            // File covers slots 0..3; ask for a time well past slot 3.
+            val s = r.slotAt(MIDNIGHT_28_APR_2026_MS + 60_000)
+            assertNotNull(s)
+            assertEquals(MIDNIGHT_28_APR_2026_MS + 3_000, s!!.timestampMs)
+            assertArrayEquals(REAL_A, s.bytes)
+        }
+    }
+
+    @Test
+    fun slotAt_findsExactSecond() {
+        val log = newLog()
+        for (i in 0 until 5) {
+            clock.set(MIDNIGHT_28_APR_2026_MS + i * 1_000L)
+            log.append(byteArrayOf(i.toByte(), 0, 0, 0))
+        }
+        log.close()
+        FrameLogReader.open(fileFor("test"))!!.use { r ->
+            for (i in 0 until 5) {
+                val s = r.slotAt(MIDNIGHT_28_APR_2026_MS + i * 1_000L)!!
+                assertEquals(i.toByte(), s.bytes[0])
+            }
+        }
+    }
+
+    @Test
+    fun slotAt_floorsToSlotBoundary() {
+        // 1-Hz nav grid: querying mid-second floors to that second's slot.
+        val log = newLog()
+        for (i in 0 until 3) {
+            clock.set(MIDNIGHT_28_APR_2026_MS + i * 1_000L)
+            log.append(byteArrayOf(i.toByte(), 0, 0, 0))
+        }
+        log.close()
+        FrameLogReader.open(fileFor("test"))!!.use { r ->
+            // 1.7 s after midnight should map to slot 1 (second 1).
+            val s = r.slotAt(MIDNIGHT_28_APR_2026_MS + 1_700)!!
+            assertEquals(1.toByte(), s.bytes[0])
+            assertEquals(MIDNIGHT_28_APR_2026_MS + 1_000, s.timestampMs)
+        }
+    }
+
+    @Test
+    fun firstSlotMs_lastSlotMs_areReported() {
+        val log = newLog()
+        clock.set(MIDNIGHT_28_APR_2026_MS + 4_000)
+        log.append(REAL_A)
+        clock.set(MIDNIGHT_28_APR_2026_MS + 9_000)
+        log.append(REAL_B)
+        log.close()
+        FrameLogReader.open(fileFor("test"))!!.use { r ->
+            // First slot is always slot 0 = file start.
+            assertEquals(MIDNIGHT_28_APR_2026_MS, r.firstSlotMs)
+            // Last slot is slot (slotCount - 1).
+            assertEquals(MIDNIGHT_28_APR_2026_MS + 9_000, r.lastSlotMs)
+        }
+    }
+
+    @Test
+    fun slotByIndex_outOfRange_returnsNull() {
+        val log = newLog()
+        log.append(REAL_A)
+        log.close()
+        FrameLogReader.open(fileFor("test"))!!.use { r ->
+            assertNull(r.slotByIndex(-1))
+            assertNull(r.slotByIndex(r.slotCount))
+            assertNotNull(r.slotByIndex(0))
+        }
+    }
+
+    @Test
     fun bms_5sPerRecord_timestampsScale() {
         val log = newLog(name = "bms", streamType = 3, recordSize = 4, secondsPerRecord = 5)
         log.append(REAL_A)                                 // slot 0 (= midnight)
