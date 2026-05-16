@@ -118,6 +118,18 @@ class ServerViewModel : ViewModel() {
     private val _historyEndMs = MutableStateFlow<Long?>(null)
     val historyEndMs: StateFlow<Long?> = _historyEndMs.asStateFlow()
 
+    /**
+     * Pinned-or-hover chart cursor (UTC ms). Shared across every chart
+     * screen so a cursor pinned on the Battery chart shows up on the
+     * History chart and Engine Graphs at the same timestamp. During
+     * playback the *effective* cursor is the playback head; chart code
+     * computes `playbackActive ? playbackPositionMs : crosshairMs`.
+     * In-memory only — clears across process restarts.
+     */
+    private val _crosshairMs = MutableStateFlow<Long?>(null)
+    val crosshairMs: StateFlow<Long?> = _crosshairMs.asStateFlow()
+    fun setCrosshairMs(ms: Long?) { _crosshairMs.value = ms }
+
     private val _port = MutableStateFlow(10110)
     val port: StateFlow<Int> = _port.asStateFlow()
 

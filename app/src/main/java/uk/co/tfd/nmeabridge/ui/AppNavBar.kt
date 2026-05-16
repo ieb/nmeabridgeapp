@@ -32,6 +32,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import uk.co.tfd.nmeabridge.history.playback.PlaybackEngine
 import uk.co.tfd.nmeabridge.service.SourceType
 import kotlin.math.PI
 import kotlin.math.cos
@@ -60,6 +61,8 @@ fun AppBottomBar(
 ) {
     val state by viewModel.serviceState.collectAsState()
     val current by viewModel.currentScreen.collectAsState()
+    val playbackState by viewModel.playbackState.collectAsState()
+    val playbackActive = playbackState != PlaybackEngine.State.STOPPED
     val navLive = state.navigationState != null
     val linkUp = state.bluetoothConnected || state.sourceType == SourceType.SIMULATOR
     val dotColor = when {
@@ -76,13 +79,32 @@ fun AppBottomBar(
                 .padding(horizontal = 6.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Connection dot + TCP client count on the far left.
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(dotColor)
-            )
+            // During playback the screens are driven by replayed
+            // history, not the live BLE stream — make that obvious so
+            // the user can tell at a glance which source is feeding
+            // the dials. Otherwise show the usual live-state dot.
+            if (playbackActive) {
+                Box(
+                    modifier = Modifier
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(3.dp))
+                        .background(Color(0xFFFFC107))  // amber
+                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                ) {
+                    Text(
+                        text = "PB",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontSize = 10.sp,
+                        color = Color.Black,
+                    )
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(dotColor)
+                )
+            }
             Spacer(Modifier.width(4.dp))
             if (state.isRunning) {
                 Text(

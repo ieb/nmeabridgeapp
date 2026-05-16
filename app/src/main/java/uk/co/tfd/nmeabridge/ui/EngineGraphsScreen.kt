@@ -1,8 +1,6 @@
 package uk.co.tfd.nmeabridge.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,29 +16,27 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import uk.co.tfd.nmeabridge.history.HistoryWindowSnapshot
+import uk.co.tfd.nmeabridge.history.playback.PlaybackEngine
 import uk.co.tfd.nmeabridge.nmea.EngineProtocol
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-
-private const val DEFAULT_ENGINE_WINDOW_MS = 5L * 60 * 1000        // 5 min
-private const val MIN_ENGINE_WINDOW_MS = 30L * 1000                // 30 s
-private const val MAX_ENGINE_WINDOW_MS = 6L * 3600 * 1000          // 6 h
 
 private val RpmColor      = Color(0xFF4FC3F7)
 private val CoolantColor  = Color(0xFFE57373)
@@ -53,24 +49,38 @@ fun EngineGraphsScreen(
     onBack: () -> Unit
 ) {
     val state by viewModel.serviceState.collectAsState()
-    val history by viewModel.engineHistory.collectAsState()
+    val windowMs by viewModel.historyWindowMs.collectAsState()
+    val endMs by viewModel.historyEndMs.collectAsState()
+    val crosshairMs by viewModel.crosshairMs.collectAsState()
+    val playbackState by viewModel.playbackState.collectAsState()
+    val playbackPositionMs by viewModel.playbackPositionMs.collectAsState()
+    val playbackActive = playbackState != PlaybackEngine.State.STOPPED
+    val effectiveCrosshair: Long? = if (playbackActive) playbackPositionMs else crosshairMs
 
-    // Shared zoom / pan / crosshair state so all four charts are synchronised.
-    var endMs by remember { mutableStateOf<Long?>(null) }          // null = pinned live
-    var windowMs by remember { mutableLongStateOf(DEFAULT_ENGINE_WINDOW_MS) }
-    var crosshairMs by remember { mutableStateOf<Long?>(null) }
-    var plotLeftPx by remember { mutableFloatStateOf(0f) }
-    var plotWidthPx by remember { mutableFloatStateOf(1f) }
-
-    val latest = if (history.size > 0) history.newestMs else System.currentTimeMillis()
-    val tEnd = endMs ?: latest
+    // Live-tail refresh tick — see HistoryScreen / BatteryScreen.
+    var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(endMs) {
+        if (endMs == null) {
+            while (true) {
+                nowTick = System.currentTimeMillis()
+                delay(CHART_LIVE_REFRESH_MS)
+            }
+        }
+    }
+    val tEnd = endMs ?: nowTick
     val tStart = tEnd - windowMs
 
-    fun pxToMs(xPx: Float): Long {
-        val w = plotWidthPx.coerceAtLeast(1f)
-        val frac = ((xPx - plotLeftPx) / w).coerceIn(0f, 1f)
-        return tStart + (frac * (tEnd - tStart)).toLong()
-    }
+    val dataSource = viewModel.historyDataSource()
+    val snapshot: HistoryWindowSnapshot = produceState(
+        initialValue = HistoryWindowSnapshot.EMPTY,
+        key1 = tStart, key2 = tEnd, key3 = dataSource,
+    ) {
+        value = dataSource?.loadWindow(tStart, tEnd) ?: HistoryWindowSnapshot.EMPTY
+    }.value
+    val history = snapshot.engine
+
+    var plotLeftPx by remember { mutableFloatStateOf(0f) }
+    var plotWidthPx by remember { mutableFloatStateOf(1f) }
 
     Column(
         modifier = Modifier
@@ -104,67 +114,23 @@ fun EngineGraphsScreen(
             return@Column
         }
 
-        // All four charts share a single gesture handler. Pinch + drag pans and
-        // zooms the shared window; tap pins the crosshair; double-tap clears.
-        // Mouse/trackpad hover moves the crosshair live on Chromebook.
+        // All four charts share the same gesture handler used by the
+        // History and Battery screens. Pinch / pan / tap / hover all
+        // route through the ViewModel so the window and cursor track
+        // every other chart screen.
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .pointerInput(history.version) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        if (zoom != 1f) {
-                            windowMs = (windowMs / zoom)
-                                .toLong()
-                                .coerceIn(MIN_ENGINE_WINDOW_MS, MAX_ENGINE_WINDOW_MS)
-                        }
-                        if (pan.x != 0f) {
-                            val w = plotWidthPx.coerceAtLeast(1f)
-                            val msPerPx = windowMs.toDouble() / w
-                            val dtMs = (-pan.x * msPerPx).toLong()
-                            val freshLatest = if (history.size > 0) history.newestMs else System.currentTimeMillis()
-                            val current = endMs ?: freshLatest
-                            val next = current + dtMs
-                            endMs = if (next >= freshLatest) null else next
-                        }
-                    }
-                }
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = { offset ->
-                            crosshairMs = pxToMs(offset.x)
-                        },
-                        onDoubleTap = {
-                            endMs = null
-                            windowMs = DEFAULT_ENGINE_WINDOW_MS
-                            crosshairMs = null
-                        }
+                .then(
+                    chartStackGestureModifier(
+                        viewModel = viewModel,
+                        tStart = tStart,
+                        tEnd = tEnd,
+                        plotLeftPx = plotLeftPx,
+                        plotWidthPx = plotWidthPx,
                     )
-                }
-                .pointerInput(Unit) {
-                    // Mouse-hover tracking for Chromebook trackpads. PointerEvent.Move
-                    // fires on non-pressed pointer motion; Exit fires when the cursor
-                    // leaves the Column. Touch drags are already consumed by the
-                    // transform handler above.
-                    awaitPointerEventScope {
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            when (event.type) {
-                                PointerEventType.Move -> {
-                                    val anyPressed = event.changes.any { it.pressed }
-                                    if (!anyPressed) {
-                                        event.changes.firstOrNull()?.let {
-                                            crosshairMs = pxToMs(it.position.x)
-                                        }
-                                    }
-                                }
-                                PointerEventType.Exit -> {
-                                    crosshairMs = null
-                                }
-                            }
-                        }
-                    }
-                },
+                ),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             EngineMetricChart(
@@ -173,7 +139,7 @@ fun EngineGraphsScreen(
                 extract = { s, i -> EngineProtocol.rpmAt(s, i)?.toDouble() },
                 tStart = tStart,
                 tEnd = tEnd,
-                crosshairMs = crosshairMs,
+                crosshairMs = effectiveCrosshair,
                 color = RpmColor,
                 fallbackLo = 0.0,
                 fallbackHi = 4000.0,
@@ -190,7 +156,7 @@ fun EngineGraphsScreen(
                 extract = EngineProtocol::coolantCAt,
                 tStart = tStart,
                 tEnd = tEnd,
-                crosshairMs = crosshairMs,
+                crosshairMs = effectiveCrosshair,
                 color = CoolantColor,
                 fallbackLo = 20.0,
                 fallbackHi = 100.0,
@@ -206,7 +172,7 @@ fun EngineGraphsScreen(
                 extract = EngineProtocol::exhaustCAt,
                 tStart = tStart,
                 tEnd = tEnd,
-                crosshairMs = crosshairMs,
+                crosshairMs = effectiveCrosshair,
                 color = ExhaustColor,
                 fallbackLo = 0.0,
                 fallbackHi = 400.0,
@@ -222,7 +188,7 @@ fun EngineGraphsScreen(
                 extract = EngineProtocol::alternatorCAt,
                 tStart = tStart,
                 tEnd = tEnd,
-                crosshairMs = crosshairMs,
+                crosshairMs = effectiveCrosshair,
                 color = AltTempColor,
                 fallbackLo = 20.0,
                 fallbackHi = 90.0,
@@ -238,7 +204,7 @@ fun EngineGraphsScreen(
         EngineGraphsStatusBar(
             windowMs = windowMs,
             isLive = endMs == null,
-            crosshairMs = crosshairMs
+            crosshairMs = effectiveCrosshair
         )
     }
 }

@@ -144,6 +144,66 @@ object BmsProtocol {
         return slot
     }
 
+    /**
+     * Decode a fixed 48 B canonical history slot (as produced by
+     * [encodeHistorySlot]) into a [BatteryState]. Unlike [decode] (which
+     * walks the variable-length wire frame), this reads each field at
+     * its fixed offset, so the padding between the cells band and the
+     * NTC count doesn't desync the cursor.
+     *
+     * Returns null when the slot is a sentinel — i.e. the gap-filler
+     * placeholder written when no BLE BMS frame arrived in the window.
+     * Matches the live path's behaviour, where a 15 s silence on the
+     * BMS characteristic causes BleNmeaSource to clear [batteryState].
+     */
+    fun decodeSlot(slot: ByteArray): BatteryState? {
+        if (slot.size != HISTORY_SLOT_SIZE) return null
+        if (slot[OFF_MAGIC] != MAGIC) return null
+        // Sentinel slots set the SoC byte to 0xFF — same value the
+        // per-field accessor uses to signal "not available". Treat as
+        // no data so the UI shows "—" / "Stream paused".
+        val socRaw = slot[OFF_SOC].toInt() and 0xFF
+        if (socRaw == 0xFF) return null
+
+        val buf = ByteBuffer.wrap(slot).order(ByteOrder.LITTLE_ENDIAN)
+
+        val packV = (buf.getShort(OFF_PACK_V).toInt() and 0xFFFF) * 0.01
+        val currentA = buf.getShort(OFF_CURRENT_A).toInt() * 0.01
+        val remainingAh = (buf.getShort(OFF_REMAINING_AH).toInt() and 0xFFFF) * 0.01
+        val fullAh = (buf.getShort(OFF_FULL_AH).toInt() and 0xFFFF) * 0.01
+        val cycles = buf.getShort(OFF_CYCLES).toInt() and 0xFFFF
+        val errors = buf.getShort(OFF_ERRORS).toInt() and 0xFFFF
+        val fetStatus = slot[OFF_FET].toInt() and 0xFF
+        val nCells = (slot[OFF_N_CELLS].toInt() and 0xFF).coerceAtMost(MAX_CELLS)
+        val nNtc = (slot[OFF_N_NTCS].toInt() and 0xFF).coerceAtMost(MAX_NTCS)
+
+        val cells = ArrayList<Double>(nCells)
+        repeat(nCells) { i ->
+            val raw = buf.getShort(OFF_CELLS + i * 2).toInt() and 0xFFFF
+            if (raw != 0xFFFF) cells += raw * 0.001
+        }
+
+        val temps = ArrayList<Double>(nNtc)
+        repeat(nNtc) { i ->
+            val raw = buf.getShort(OFF_NTCS + i * 2).toInt() and 0xFFFF
+            if (raw != 0xFFFF) temps += raw * 0.1 - 273.15
+        }
+
+        return BatteryState(
+            packV = packV,
+            currentA = currentA,
+            remainingAh = remainingAh,
+            fullAh = fullAh,
+            soc = socRaw,
+            cycles = cycles,
+            cellVoltagesV = cells,
+            tempsC = temps,
+            chargeFet = (fetStatus and 0x01) != 0,
+            dischargeFet = (fetStatus and 0x02) != 0,
+            alarms = BmsAlarm.decode(errors)
+        )
+    }
+
     // --- Per-field accessors over a history RingSnapshot -----------------
     //
     // These read the 48 B history slot produced by encodeHistorySlot().

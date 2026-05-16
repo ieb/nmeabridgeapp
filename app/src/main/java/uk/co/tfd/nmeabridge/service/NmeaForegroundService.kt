@@ -368,24 +368,29 @@ class NmeaForegroundService : Service() {
         }
         nmeaSource = source
 
-        // Collect navigation and battery state from BLE source
+        // Collect navigation and battery state from BLE source. Gated
+        // on !playbackActive so that during playback the screens are
+        // driven by the playback engine (mirrored in
+        // [ensurePlaybackMirrors]) rather than the live BLE link. The
+        // raw-frame collectors below stay ungated — history capture
+        // is independent of which source the UI reads from.
         if (source is BleNmeaSource) {
             serviceScope.launch {
                 // Forward nulls too: the BLE source emits null when it hasn't
                 // seen a nav frame for the staleness window, and the UI relies
                 // on navigationState going null to fall back to "---".
                 source.navigationState.collect { nav ->
-                    _state.update { it.copy(navigationState = nav) }
+                    if (!playbackActive) _state.update { it.copy(navigationState = nav) }
                 }
             }
             serviceScope.launch {
                 source.batteryState.collect { battery ->
-                    _state.update { it.copy(batteryState = battery) }
+                    if (!playbackActive) _state.update { it.copy(batteryState = battery) }
                 }
             }
             serviceScope.launch {
                 source.engineState.collect { engine ->
-                    _state.update { it.copy(engineState = engine) }
+                    if (!playbackActive) _state.update { it.copy(engineState = engine) }
                 }
             }
             // Feed raw wire frames into the in-memory history rings
@@ -497,6 +502,11 @@ class NmeaForegroundService : Service() {
      */
     fun startPlayback(positionMs: Long, speedX: Int = 1) {
         playbackActive = true
+        // Drop live nav/engine/battery so the screens don't briefly
+        // hold the last live values while waiting for the first
+        // playback tick. The next playback tick (inside runLoop)
+        // fires immediately and repopulates them.
+        _state.update { it.copy(navigationState = null, engineState = null, batteryState = null) }
         playbackEngine.start(positionMs, speedX)
         // Mirror engine state into our public StateFlows so VM can
         // bind to them. These collectors are launched lazily via
@@ -517,6 +527,10 @@ class NmeaForegroundService : Service() {
     fun stopPlayback() {
         playbackActive = false
         playbackEngine.stop()
+        // Drop the last replayed values so screens fall back to "—"
+        // until the next live BLE notification refreshes them. If BLE
+        // is disconnected, the screens correctly stay empty.
+        _state.update { it.copy(navigationState = null, engineState = null, batteryState = null) }
     }
 
     @Volatile private var playbackMirrorsStarted: Boolean = false
@@ -532,6 +546,25 @@ class NmeaForegroundService : Service() {
         }
         serviceScope.launch {
             playbackEngine.speed.collect { _playbackSpeed.value = it }
+        }
+        // Route decoded playback state into ServiceState whenever
+        // playback is active. The live BLE collectors are gated by
+        // !playbackActive (see onStartCommand), so the two sources
+        // can't fight over the same field.
+        serviceScope.launch {
+            playbackEngine.navigationState.collect { nav ->
+                if (playbackActive) _state.update { it.copy(navigationState = nav) }
+            }
+        }
+        serviceScope.launch {
+            playbackEngine.engineState.collect { engine ->
+                if (playbackActive) _state.update { it.copy(engineState = engine) }
+            }
+        }
+        serviceScope.launch {
+            playbackEngine.batteryState.collect { battery ->
+                if (playbackActive) _state.update { it.copy(batteryState = battery) }
+            }
         }
     }
 

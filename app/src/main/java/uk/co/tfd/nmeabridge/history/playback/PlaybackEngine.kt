@@ -10,7 +10,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import uk.co.tfd.nmeabridge.history.persist.FrameLogReader
 import uk.co.tfd.nmeabridge.history.persist.HistoryLogger
+import uk.co.tfd.nmeabridge.nmea.BatteryState
 import uk.co.tfd.nmeabridge.nmea.BinaryProtocol
+import uk.co.tfd.nmeabridge.nmea.BmsProtocol
+import uk.co.tfd.nmeabridge.nmea.EngineProtocol
+import uk.co.tfd.nmeabridge.nmea.EngineState
 import uk.co.tfd.nmeabridge.nmea.NavigationState
 import java.io.File
 import java.text.SimpleDateFormat
@@ -19,14 +23,24 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * Replays recorded nav frames out as NMEA-0183 sentences at a constant
- * 1 Hz cadence (matching the recorded sample rate). Speed multipliers
- * scale how far the *playback clock* advances between ticks, not how
- * fast sentences arrive on the wire — Navionics & friends keep
- * receiving fixes at 1 Hz at every speed.
+ * Replays recorded frames out as both decoded state and (for nav)
+ * NMEA-0183 sentences at a constant 1 Hz cadence (matching the
+ * recorded sample rate). Speed multipliers scale how far the
+ * *playback clock* advances between ticks, not how fast sentences
+ * arrive on the wire — Navionics & friends keep receiving fixes at
+ * 1 Hz at every speed.
+ *
+ * Three streams are replayed in lock-step at the same UTC ms:
+ *  - nav    (1 s/slot) → [navigationState] + NMEA sentences on [sink]
+ *  - engine (1 s/slot) → [engineState]
+ *  - bms    (5 s/slot) → [batteryState]
+ *
+ * Engine and BMS don't go on the NMEA0183 wire — matches the live
+ * path. Their decoded states drive the on-device Engine and Battery
+ * screens during playback.
  *
  * Pause behaviour: the engine keeps emitting at 1 Hz; only the
- * playback position stops advancing. The same nav frame is re-emitted
+ * playback position stops advancing. The same frames are re-emitted
  * each tick so downstream chartplotters don't see the stream go quiet
  * (which would trigger reconnects) — they just see a stationary boat
  * with a moving ZDA timestamp.
@@ -55,12 +69,41 @@ class PlaybackEngine(
     private val _speed = MutableStateFlow(1)
     val speed: StateFlow<Int> = _speed.asStateFlow()
 
+    // Decoded state for the on-device screens. Null when the slot at
+    // the current playback position is a sentinel, missing, or before
+    // the start of recorded history for that stream.
+    private val _navigationState = MutableStateFlow<NavigationState?>(null)
+    val navigationState: StateFlow<NavigationState?> = _navigationState.asStateFlow()
+
+    private val _engineState = MutableStateFlow<EngineState?>(null)
+    val engineState: StateFlow<EngineState?> = _engineState.asStateFlow()
+
+    private val _batteryState = MutableStateFlow<BatteryState?>(null)
+    val batteryState: StateFlow<BatteryState?> = _batteryState.asStateFlow()
+
     private var job: Job? = null
 
-    // Currently-open reader. Re-opened lazily when the playback clock
-    // crosses a UTC date boundary.
-    private var reader: FrameLogReader? = null
-    private var readerDate: String? = null
+    // One slot per stream. Each holds the currently-open reader and the
+    // UTC date that reader is open for. Reader is re-opened lazily when
+    // the playback clock crosses a UTC date boundary.
+    private val navSlot = StreamSlot(
+        streamName = "nav",
+        expectedStreamType = HistoryLogger.STREAM_NAV,
+        expectedRecordSize = BinaryProtocol.FRAME_SIZE,
+        expectedSecondsPerRecord = 1,
+    )
+    private val engineSlot = StreamSlot(
+        streamName = "engine",
+        expectedStreamType = HistoryLogger.STREAM_ENGINE,
+        expectedRecordSize = EngineProtocol.FRAME_SIZE,
+        expectedSecondsPerRecord = 1,
+    )
+    private val bmsSlot = StreamSlot(
+        streamName = "bms",
+        expectedStreamType = HistoryLogger.STREAM_BMS,
+        expectedRecordSize = BmsProtocol.HISTORY_SLOT_SIZE,
+        expectedSecondsPerRecord = 5,
+    )
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -101,13 +144,18 @@ class PlaybackEngine(
         _speed.value = speedX
     }
 
-    /** Stop playback. Cancels the loop, closes any open reader. The
-     *  service should call this when switching back to LIVE. */
+    /** Stop playback. Cancels the loop, closes any open readers, and
+     *  clears decoded state so the on-device screens fall back to "—"
+     *  while the live source repopulates. The service should call this
+     *  when switching back to LIVE. */
     fun stop() {
         _state.value = State.STOPPED
         job?.cancel()
         job = null
-        closeReader()
+        closeReaders()
+        _navigationState.value = null
+        _engineState.value = null
+        _batteryState.value = null
     }
 
     private suspend fun runLoop() {
@@ -119,22 +167,45 @@ class PlaybackEngine(
 
     private fun tick() {
         val pos = _positionMs.value
-        // Always emit something — at minimum an empty NavigationState's
+
+        val nav = decodeNav(pos)
+        _navigationState.value = nav
+        // Always emit nav sentences — at minimum an empty NavigationState's
         // ZDA — so the TCP client never sees the stream go quiet, no
         // matter how dark the playback region is.
-        val nav = decodeAt(pos) ?: NavigationState()
-        for (sentence in BinaryProtocol.toNmeaSentences(nav)) {
+        for (sentence in BinaryProtocol.toNmeaSentences(nav ?: NavigationState())) {
             sink.tryEmit(sentence)
         }
+
+        _engineState.value = decodeEngine(pos)
+        _batteryState.value = decodeBattery(pos)
+
         if (_state.value == State.PLAYING) {
             advance(pos)
         }
     }
 
-    private fun decodeAt(positionMs: Long): NavigationState? {
-        val r = readerFor(positionMs) ?: return null
-        val slot = r.slotAt(positionMs) ?: return null
-        return BinaryProtocol.decode(slot.bytes)
+    private fun decodeNav(positionMs: Long): NavigationState? {
+        val bytes = readSlotBytes(navSlot, positionMs) ?: return null
+        return BinaryProtocol.decode(bytes)
+    }
+
+    private fun decodeEngine(positionMs: Long): EngineState? {
+        val bytes = readSlotBytes(engineSlot, positionMs) ?: return null
+        return EngineProtocol.decode(bytes)
+    }
+
+    private fun decodeBattery(positionMs: Long): BatteryState? {
+        val bytes = readSlotBytes(bmsSlot, positionMs) ?: return null
+        // The canonical 48 B history slot has fixed offsets — the wire
+        // decode (BmsProtocol.decode) walks variable-length cells and
+        // would misread the padding band between cells and n_ntc.
+        return BmsProtocol.decodeSlot(bytes)
+    }
+
+    private fun readSlotBytes(slot: StreamSlot, positionMs: Long): ByteArray? {
+        val r = readerFor(slot, positionMs) ?: return null
+        return r.slotAt(positionMs)?.bytes
     }
 
     private fun advance(currentPos: Long) {
@@ -151,24 +222,45 @@ class PlaybackEngine(
         }
     }
 
-    private fun readerFor(positionMs: Long): FrameLogReader? {
+    private fun readerFor(slot: StreamSlot, positionMs: Long): FrameLogReader? {
         val date = dateFormat.format(Date(positionMs))
-        if (date == readerDate) return reader
-        closeReader()
-        val file = FrameLogReader.fileFor(historyDir, "nav", date)
-        reader = FrameLogReader.open(
+        if (date == slot.readerDate) return slot.reader
+        slot.close()
+        val file = FrameLogReader.fileFor(historyDir, slot.streamName, date)
+        slot.reader = FrameLogReader.open(
             file,
-            expectedStreamType = HistoryLogger.STREAM_NAV,
-            expectedRecordSize = BinaryProtocol.FRAME_SIZE,
-            expectedSecondsPerRecord = 1,
+            expectedStreamType = slot.expectedStreamType,
+            expectedRecordSize = slot.expectedRecordSize,
+            expectedSecondsPerRecord = slot.expectedSecondsPerRecord,
         )
-        readerDate = date
-        return reader
+        slot.readerDate = date
+        return slot.reader
     }
 
-    private fun closeReader() {
-        reader?.close()
-        reader = null
-        readerDate = null
+    private fun closeReaders() {
+        navSlot.close()
+        engineSlot.close()
+        bmsSlot.close()
+    }
+
+    /**
+     * Per-stream playback state: the currently-open reader, the UTC date
+     * it covers, and the file-format expectations used to validate the
+     * header when re-opening across day boundaries.
+     */
+    private class StreamSlot(
+        val streamName: String,
+        val expectedStreamType: Int,
+        val expectedRecordSize: Int,
+        val expectedSecondsPerRecord: Int,
+    ) {
+        var reader: FrameLogReader? = null
+        var readerDate: String? = null
+
+        fun close() {
+            reader?.close()
+            reader = null
+            readerDate = null
+        }
     }
 }

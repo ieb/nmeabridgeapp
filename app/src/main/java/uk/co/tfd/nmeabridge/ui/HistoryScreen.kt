@@ -1,8 +1,6 @@
 package uk.co.tfd.nmeabridge.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,15 +35,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -59,10 +54,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private const val DEFAULT_WINDOW_MS = 5L * 60 * 1000          // 5 min
-private const val MIN_WINDOW_MS = 30L * 1000                  // 30 s
-private const val MAX_WINDOW_MS = 30L * 24 * 3600 * 1000      // 30 days
-private const val LIVE_REFRESH_MS = 2_000L                    // re-pull while live
 private const val CHART_HEIGHT_DP = 180
 
 @Composable
@@ -78,21 +69,24 @@ fun HistoryScreen(viewModel: ServerViewModel) {
     val playbackSpeed by viewModel.playbackSpeed.collectAsState()
     val playbackActive = playbackState != uk.co.tfd.nmeabridge.history.playback.PlaybackEngine.State.STOPPED
 
+    val crosshairMs by viewModel.crosshairMs.collectAsState()
+
     // Resolve the window. tEnd-now if live, otherwise the persisted endMs.
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(endMs) {
         if (endMs == null) {
             while (true) {
                 nowTick = System.currentTimeMillis()
-                delay(LIVE_REFRESH_MS)
+                delay(CHART_LIVE_REFRESH_MS)
             }
         }
     }
     val tEnd = endMs ?: nowTick
     val tStart = tEnd - windowMs
 
-    // Crosshair (per composition) and shared plot bounds for cursor sync.
-    var crosshairMs by remember { mutableStateOf<Long?>(null) }
+    // Plot bounds reported by the chart back to the gesture handler so
+    // pointer X coords translate into timestamps. Updated by every
+    // HistoryChartPanel via onPlotLayout below.
     var plotLeftPx by remember { mutableFloatStateOf(0f) }
     var plotWidthPx by remember { mutableFloatStateOf(1f) }
 
@@ -100,7 +94,6 @@ fun HistoryScreen(viewModel: ServerViewModel) {
     // the engine's position regardless of mouse motion. While the engine
     // is stopped, the cursor follows the user's hover/tap as before.
     val effectiveCrosshair: Long? = if (playbackActive) playbackPositionMs else crosshairMs
-    val playbackActiveState by rememberUpdatedState(playbackActive)
 
     // Pull a fresh snapshot whenever the window or chart layout changes.
     val dataSource = viewModel.historyDataSource()
@@ -113,26 +106,6 @@ fun HistoryScreen(viewModel: ServerViewModel) {
 
     // Active picker dialog state.
     var pickerForChart by remember { mutableStateOf<Int?>(null) }
-
-    // The pointerInput modifiers below are keyed on Unit (so the gesture
-    // handlers aren't recreated mid-gesture), but their lambdas need to
-    // see the *current* time window and chart bounds to translate
-    // pointer events correctly. Local `val tStart` / `val tEnd` are
-    // captured by value at first composition and would go stale after
-    // any pan or zoom — exactly the symptom that caused the cursor to
-    // de-sync. rememberUpdatedState keeps the references live.
-    val currentTStart by rememberUpdatedState(tStart)
-    val currentTEnd by rememberUpdatedState(tEnd)
-    val currentWindowMs by rememberUpdatedState(windowMs)
-    val currentEndMs by rememberUpdatedState(endMs)
-
-    fun pxToMs(xPx: Float): Long {
-        val w = plotWidthPx.coerceAtLeast(1f)
-        val frac = ((xPx - plotLeftPx) / w).coerceIn(0f, 1f)
-        val ts = currentTStart
-        val te = currentTEnd
-        return ts + (frac * (te - ts)).toLong()
-    }
 
     TopLevelScreen(
         viewModel = viewModel,
@@ -155,8 +128,8 @@ fun HistoryScreen(viewModel: ServerViewModel) {
                 onAddChart = { viewModel.addHistoryChart(context) },
                 onResetView = {
                     viewModel.setHistoryEndMs(context, null)
-                    viewModel.setHistoryWindowMs(context, DEFAULT_WINDOW_MS)
-                    if (!playbackActive) crosshairMs = null
+                    viewModel.setHistoryWindowMs(context, CHART_DEFAULT_WINDOW_MS)
+                    if (!playbackActive) viewModel.setCrosshairMs(null)
                 },
                 onPlayPause = {
                     when (playbackState) {
@@ -185,78 +158,20 @@ fun HistoryScreen(viewModel: ServerViewModel) {
 
             // Charts column. The shared gesture handler is on this Column
             // so a pinch / drag / hover anywhere on the stack pans/zooms
-            // every chart in step.
+            // every chart in step — and the same handler is reused on
+            // the Battery and Engine Graphs screens.
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .pointerInput(Unit) {
-                        detectTransformGestures { _, pan, zoom, _ ->
-                            // Always read the *current* window via the
-                            // live State delegates; capturing the locals
-                            // would freeze them at first-composition.
-                            if (zoom != 1f) {
-                                val newWindow = (currentWindowMs / zoom)
-                                    .toLong()
-                                    .coerceIn(MIN_WINDOW_MS, MAX_WINDOW_MS)
-                                viewModel.setHistoryWindowMs(context, newWindow)
-                            }
-                            if (pan.x != 0f) {
-                                val w = plotWidthPx.coerceAtLeast(1f)
-                                val msPerPx = currentWindowMs.toDouble() / w
-                                val dt = (-pan.x * msPerPx).toLong()
-                                val freshLatest = System.currentTimeMillis()
-                                val curEnd = currentEndMs ?: freshLatest
-                                val next = curEnd + dt
-                                viewModel.setHistoryEndMs(
-                                    context,
-                                    if (next >= freshLatest) null else next,
-                                )
-                            }
-                        }
-                    }
-                    .pointerInput(Unit) {
-                        detectTapGestures(
-                            onTap = { offset ->
-                                val ms = pxToMs(offset.x)
-                                if (playbackActiveState) {
-                                    // While playing/paused, tap seeks
-                                    // the playhead instead of moving a
-                                    // hover crosshair.
-                                    viewModel.seekPlayback(ms)
-                                } else {
-                                    crosshairMs = ms
-                                }
-                            },
-                            onDoubleTap = {
-                                viewModel.setHistoryEndMs(context, null)
-                                viewModel.setHistoryWindowMs(context, DEFAULT_WINDOW_MS)
-                                if (!playbackActiveState) crosshairMs = null
-                            },
+                    .then(
+                        chartStackGestureModifier(
+                            viewModel = viewModel,
+                            tStart = tStart,
+                            tEnd = tEnd,
+                            plotLeftPx = plotLeftPx,
+                            plotWidthPx = plotWidthPx,
                         )
-                    }
-                    .pointerInput(Unit) {
-                        // Hover (Chromebook trackpad) tracking for the
-                        // crosshair. Suppressed during playback — the
-                        // cursor IS the playhead and the user shouldn't
-                        // be able to drag it sideways with the mouse.
-                        awaitPointerEventScope {
-                            while (true) {
-                                val ev = awaitPointerEvent()
-                                if (playbackActiveState) continue
-                                when (ev.type) {
-                                    PointerEventType.Move -> {
-                                        val anyPressed = ev.changes.any { it.pressed }
-                                        if (!anyPressed) {
-                                            ev.changes.firstOrNull()?.let {
-                                                crosshairMs = pxToMs(it.position.x)
-                                            }
-                                        }
-                                    }
-                                    PointerEventType.Exit -> { crosshairMs = null }
-                                }
-                            }
-                        }
-                    },
+                    ),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 LazyColumn(
@@ -619,13 +534,3 @@ private fun displayCategoryName(prefix: String): String = when (prefix) {
 // today at a glance.
 private val crosshairTimeFmt: SimpleDateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
-// ------------------------------------------------------------------
-// Glue: expose the service-side HistoryDataSource through the VM. The
-// VM keeps a nullable handle that follows whether the service is bound.
-// ------------------------------------------------------------------
-
-@Composable
-private fun ServerViewModel.historyDataSource(): uk.co.tfd.nmeabridge.history.HistoryDataSource? {
-    val service by this.boundService.collectAsState()
-    return service?.historyDataSource
-}

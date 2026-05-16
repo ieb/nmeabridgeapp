@@ -27,6 +27,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -49,8 +51,44 @@ fun BatteryScreen(
     viewModel: ServerViewModel,
 ) {
     val state by viewModel.serviceState.collectAsState()
-    val history by viewModel.batteryHistory.collectAsState()
     val battery = state.batteryState
+    val windowMs by viewModel.historyWindowMs.collectAsState()
+    val endMs by viewModel.historyEndMs.collectAsState()
+    val crosshairMs by viewModel.crosshairMs.collectAsState()
+    val playbackState by viewModel.playbackState.collectAsState()
+    val playbackPositionMs by viewModel.playbackPositionMs.collectAsState()
+    val playbackActive = playbackState != uk.co.tfd.nmeabridge.history.playback.PlaybackEngine.State.STOPPED
+    val effectiveCrosshair: Long? = if (playbackActive) playbackPositionMs else crosshairMs
+
+    // Live-tail refresh tick — matches HistoryScreen. Re-pulls the disk
+    // snapshot every CHART_LIVE_REFRESH_MS while pinned to live (endMs==null).
+    var nowTick by remember { androidx.compose.runtime.mutableLongStateOf(System.currentTimeMillis()) }
+    androidx.compose.runtime.LaunchedEffect(endMs) {
+        if (endMs == null) {
+            while (true) {
+                nowTick = System.currentTimeMillis()
+                kotlinx.coroutines.delay(CHART_LIVE_REFRESH_MS)
+            }
+        }
+    }
+    val tEnd = endMs ?: nowTick
+    val tStart = tEnd - windowMs
+
+    val dataSource = viewModel.historyDataSource()
+    val snapshot: uk.co.tfd.nmeabridge.history.HistoryWindowSnapshot =
+        androidx.compose.runtime.produceState(
+            initialValue = uk.co.tfd.nmeabridge.history.HistoryWindowSnapshot.EMPTY,
+            key1 = tStart, key2 = tEnd, key3 = dataSource,
+        ) {
+            value = dataSource?.loadWindow(tStart, tEnd)
+                ?: uk.co.tfd.nmeabridge.history.HistoryWindowSnapshot.EMPTY
+        }.value
+
+    // Plot bounds reported by the chart so the gesture handler can
+    // translate pointer X coords back to timestamps.
+    var plotLeftPx by remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
+    var plotWidthPx by remember { androidx.compose.runtime.mutableFloatStateOf(1f) }
+
     val screenHeightDp = LocalConfiguration.current.screenHeightDp.dp
     val chartHeight = screenHeightDp * 0.33f
 
@@ -75,13 +113,35 @@ fun BatteryScreen(
             modifier = Modifier.fillMaxWidth(),
         )
 
-        // Top third: V/I time-series chart (uses in-memory history from the VM)
-        BatteryChart(
-            history = history,
+        // V/I time-series chart, wired to the shared time window and
+        // cursor so it stays in sync with the History and Engine Graphs
+        // screens. The shared gesture handler wraps only the chart so
+        // vertical drag past it still scrolls the dial cards below.
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(chartHeight)
-        )
+                .then(
+                    chartStackGestureModifier(
+                        viewModel = viewModel,
+                        tStart = tStart,
+                        tEnd = tEnd,
+                        plotLeftPx = plotLeftPx,
+                        plotWidthPx = plotWidthPx,
+                    )
+                )
+        ) {
+            BatteryChart(
+                history = snapshot.battery,
+                tStart = tStart,
+                tEnd = tEnd,
+                windowMs = windowMs,
+                isLive = endMs == null,
+                crosshairMs = effectiveCrosshair,
+                modifier = Modifier.fillMaxSize(),
+                onPlotLayout = { l, w -> plotLeftPx = l; plotWidthPx = w },
+            )
+        }
 
         if (!state.bluetoothConnected || battery == null) {
             Box(
@@ -94,7 +154,7 @@ fun BatteryScreen(
                     text = when {
                         !state.isRunning -> "Server stopped"
                         !state.bluetoothConnected -> "Waiting for BLE connection…"
-                        history.size > 0 -> "Stream paused"
+                        snapshot.battery.size > 0 -> "Stream paused"
                         else -> "Subscribing to battery…"
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant
