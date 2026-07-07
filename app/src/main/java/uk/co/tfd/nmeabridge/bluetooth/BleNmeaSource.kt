@@ -61,9 +61,20 @@ class BleNmeaSource(
         // state so dials and the nav dot stop showing frozen numbers. The
         // BLE / GATT link stays up either way — BMS (on its own power rail)
         // can continue to flow even when the N2K bus is off.
-        private const val NAV_STALENESS_MS = 5_000L
-        private const val ENGINE_STALENESS_MS = 5_000L
+        //
+        // 10 s (not the "obvious" 5 s) because on shared-antenna
+        // Chromebooks — verified on the Acer R13 — GmsCore's Google
+        // Location Accuracy runs a Wi-Fi scan every ~2 min that starves
+        // BLE reception on the shared 2.4 GHz radio for ~6 s
+        // (`CMD_START_SINGLE_SCAN … Scan Completed` in logcat). Firmware
+        // keeps transmitting, but our GATT callback receives nothing until
+        // the scan finishes. 5 s tripped this watchdog on every scan and
+        // caused the UI to blink to "—". 10 s clears the scan gap with
+        // margin while still catching real BLE outages within ~2 samples.
+        private const val NAV_STALENESS_MS = 10_000L
+        private const val ENGINE_STALENESS_MS = 10_000L
         // BMS cadence is slower (~5 s); allow more silence before clearing.
+        // Kept at 15 s — already covers the Wi-Fi scan window.
         private const val BATTERY_STALENESS_MS = 15_000L
     }
 
