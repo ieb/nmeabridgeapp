@@ -59,6 +59,7 @@ class ServerViewModel : ViewModel() {
         private const val KEY_HISTORY_WINDOW_MS = "history_window_ms"
         private const val KEY_HISTORY_END_MS = "history_end_ms"     // -1 = live
         private val NAV_SERVICE_PARCEL = ParcelUuid(BleNmeaSource.NMEA_SERVICE_UUID)
+        private val BW_SERVICE_PARCEL  = ParcelUuid(BleNmeaSource.BW_SERVICE_UUID)
 
         /** Default chart layout shown the first time the user opens the History screen. */
         private val DEFAULT_HISTORY_LAYOUT: List<HistoryChartConfig> = listOf(
@@ -177,10 +178,16 @@ class ServerViewModel : ViewModel() {
             if (address in seenBleAddresses) return
 
             val deviceName = try { result.device.name } catch (_: Exception) { null }
-            val advertisesNavService = result.scanRecord?.serviceUuids?.contains(NAV_SERVICE_PARCEL) == true
+            // Firmware advertises the BoatWatch service (AA00); the Nav service (FF00)
+            // is present after connect but not in the advertisement, so we accept
+            // either UUID (defensive, in case the firmware advertises FF00 later).
+            val advertisedUuids = result.scanRecord?.serviceUuids
+            val advertisesBridge =
+                advertisedUuids?.contains(BW_SERVICE_PARCEL) == true ||
+                advertisedUuids?.contains(NAV_SERVICE_PARCEL) == true
 
-            // Only show devices that advertise the Nav Data service or have a name
-            if (!advertisesNavService && deviceName == null) return
+            // Only show devices that advertise our service or have a name
+            if (!advertisesBridge && deviceName == null) return
 
             seenBleAddresses.add(address)
             val name = deviceName ?: "BLE Nav"

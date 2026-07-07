@@ -601,7 +601,15 @@ class BleNmeaSource(
         val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val adapter = btManager?.adapter
         if (adapter == null || !adapter.isEnabled) {
-            onConnectionStateChanged(false, "Bluetooth not available")
+            // ChromeOS/ARC periodically cycles the BT adapter (seen as
+            // APPLICATION_REQUEST by org.chromium.arc.intent_helper). During
+            // that ~8 s window the adapter reports !isEnabled. Keep polling
+            // — the previous "return without reschedule" was a permanent
+            // give-up: the app would stall silently until the user restarted
+            // the server. handler.removeCallbacksAndMessages(null) in stop()
+            // clears this pending post, so no leak.
+            onConnectionStateChanged(false, "Bluetooth off, retrying in 3s...")
+            handler.postDelayed({ doConnect() }, RECONNECT_DELAY_MS)
             return
         }
 

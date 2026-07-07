@@ -17,6 +17,23 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Pin the debug signing key to a project-local file so Android Studio
+    // reinstalls / ~/.android/ resets can't invalidate installs on the
+    // Chromebook (a fresh keystore fails INSTALL_FAILED_UPDATE_INCOMPATIBLE
+    // and forces uninstall, which wipes history). Falls back to the default
+    // ~/.android/debug.keystore if the project-local file is absent.
+    signingConfigs {
+        getByName("debug") {
+            val local = file("debug.keystore")
+            if (local.exists()) {
+                storeFile = local
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
